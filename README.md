@@ -18,6 +18,8 @@ file; run it on any machine the clients (and your LiveKit server) can reach.
 ## Setup
 
 You need Node 20 or newer and a running [LiveKit](https://livekit.io) server.
+LiveKit is a separate program that is **not bundled** with this server; see
+[docs/livekit.md](docs/livekit.md) for a basic setup guide.
 
     cp .env.example .env      # then fill it in (see below)
     npm ci
@@ -220,6 +222,8 @@ changing your picture updates it everywhere, old messages included.
 
 ## Not built yet
 
+- LiveKit bundled with the server, so one setup installs both. Today you install
+  and configure LiveKit yourself (see `docs/livekit.md`).
 - Real-time push: clients poll for tree and chat changes every few seconds.
 - Fine-grained permissions: per-server admin is all-or-nothing, and only the
   creator is an admin.
