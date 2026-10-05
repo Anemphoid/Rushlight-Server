@@ -43,22 +43,13 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
 - Foreign key enforcement is off (as it has always been); deletes clean up their
   own children explicitly.
 
-## Where we left off (temporary: delete this section after the migration)
+## Known gaps and backlog
 
-- **v0.2.0 is released, but the owner's server machine still runs the old zip
-  version.** They will move it onto this repo when they have a terminal there,
-  following docs/migrate-existing-install.md. They also planned to rotate the
-  LiveKit secret at the same time.
-- **After they migrate**, ask them to confirm: `/api/health` answers, the log
-  says it applied 2 migrations (usernames unique ignoring case, revocable codes),
-  their own account still logs in, and their server and chat are intact. Then
-  delete this section.
-- **Not verified anywhere yet:** the systemd flow in install-service.sh,
-  update.sh and install-auto-update.sh on a real machine, and a real LiveKit
-  disconnect when a code is revoked or a member is kicked (tests use an
-  unreachable LiveKit address, so that part is best effort and untested).
+- **Not tested against a real LiveKit server:** the tests use an unreachable
+  LiveKit address, so disconnecting someone on kick or code revoke is best effort
+  and is untested until someone tries it on a live server.
 - **Possible next work:** real-time push (for example server-sent events) to
-  replace the clients' polling, server-side unread counts, profile bio/status/
-  banner fields, settings sync across machines, and more than one admin per
-  server (only the creator is an admin today). A client screen to list and revoke
-  join codes is planned in the client repo; the endpoints already exist here.
+  replace the clients' polling, server-side unread counts, profile bio, status and
+  banner fields, settings sync across machines, and more than one admin per server
+  (only the creator is an admin today). A client screen to list and revoke join
+  codes is planned in the client repo; the endpoints already exist here.
