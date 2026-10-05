@@ -8,12 +8,21 @@ if (!JWT_SECRET) {
   )
 }
 
+// The async forms yield between rounds, so one login doesn't freeze the whole
+// server (and everyone's presence check-ins) for the length of a hash.
 export function hashPassword(password) {
-  return bcrypt.hashSync(password, 12)
+  return bcrypt.hash(password, 12)
 }
 
 export function verifyPassword(password, hash) {
-  return bcrypt.compareSync(password, hash)
+  return bcrypt.compare(password, hash)
+}
+
+// A login for a username that doesn't exist still does a full hash compare, so
+// the response time doesn't reveal which usernames are real.
+const DUMMY_HASH = bcrypt.hashSync('rushlight-timing-equalizer', 12)
+export function verifyAgainstNobody(password) {
+  return bcrypt.compare(password, DUMMY_HASH)
 }
 
 export function signSession(account) {
@@ -27,9 +36,11 @@ export function signSession(account) {
 // Guests (joined with a code, no account) get a narrow token: it only says
 // "this person was let into this one server". It can ask for voice access to
 // that server's rooms and nothing else.
-export function signGuest({ serverId, screenName, identity }) {
-  return jwt.sign({ guest: true, serverId, screenName, identity }, JWT_SECRET, {
-    expiresIn: '12h'
+// codeId ties the guest to the join code they used, so revoking that code cuts
+// them off. The token also never outlives the code's own expiry.
+export function signGuest({ serverId, screenName, identity, codeId, expiresInSeconds }) {
+  return jwt.sign({ guest: true, serverId, screenName, identity, codeId }, JWT_SECRET, {
+    expiresIn: Math.max(1, Math.floor(expiresInSeconds))
   })
 }
 

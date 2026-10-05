@@ -1,11 +1,14 @@
 {
   "name": "rushlight-server",
-  "version": "0.1.0",
-  "description": "Rushlight Alpha 2 backend — accounts, join codes, LiveKit token issuing",
+  "version": "0.2.0",
+  "description": "Rushlight server: accounts, servers, join codes, chat history, and LiveKit token issuing",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test --test-concurrency=1 test/server.test.js test/migrations.test.js",
+    "test:update": "bash test/update-flow.sh",
+    "backup": "node scripts/backup-db.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -16,5 +19,9 @@
     "express-rate-limit": "^8.7.0",
     "jsonwebtoken": "^9.0.2",
     "livekit-server-sdk": "^2.7.2"
-  }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
 }

@@ -1,6 +1,9 @@
+import { randomInt } from 'node:crypto'
+
 // Simple word list for Vaultwarden-style join codes (word-word-number).
-// Not cryptographically exhaustive — just needs to be easy to say and type,
-// with the trailing number adding enough entropy for a short-lived code.
+// Easy to say and type. 86 words twice plus a four digit number is about 66
+// million combinations, drawn from a cryptographic random source, and the join
+// endpoints are rate limited on top of that.
 export const WORDS = [
   'amber', 'ash', 'aspen', 'birch', 'blaze', 'bramble', 'briar', 'brook',
   'cedar', 'clover', 'coal', 'copper', 'coral', 'crane', 'crow', 'dawn',
@@ -16,8 +19,8 @@ export const WORDS = [
 ]
 
 export function generateCode() {
-  const a = WORDS[Math.floor(Math.random() * WORDS.length)]
-  const b = WORDS[Math.floor(Math.random() * WORDS.length)]
-  const n = Math.floor(Math.random() * 90) + 10 // 10-99
+  const a = WORDS[randomInt(WORDS.length)]
+  const b = WORDS[randomInt(WORDS.length)]
+  const n = randomInt(1000, 10000) // 1000-9999
   return `${a}-${b}-${n}`
 }

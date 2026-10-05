@@ -1,0 +1,25 @@
+# Runs the test suite on every push and pull request.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: API, security and migration tests
+        run: npm test
+
+      - name: Update script (update, rollback, refuse over local edits)
+        run: npm run test:update

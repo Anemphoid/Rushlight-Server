@@ -2,12 +2,14 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import rateLimit from 'express-rate-limit'
+import { randomBytes } from 'node:crypto'
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { db } from './db.js'
 import { generateCode } from './wordlist.js'
 import {
   hashPassword,
   verifyPassword,
+  verifyAgainstNobody,
   signSession,
   signGuest,
   requireAuth,
@@ -30,7 +32,38 @@ const roomService = new RoomServiceClient(
 
 const app = express()
 app.use(cors())
-app.use(express.json({ limit: '2mb' }))
+// Avatars arrive as base64 (about a third bigger than the 1.5MB image limit).
+app.use(express.json({ limit: '3mb' }))
+
+// --- Small input helpers --------------------------------------------------
+// Request bodies are untrusted: a field that isn't the type the route expects
+// must produce a 400, never reach the database (which throws on odd types).
+const MODES = new Set(['voice', 'text', 'both'])
+const MAX_NAME = 64
+const MAX_MINUTES = 60 * 24 * 365
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/
+
+// Express 4 does not catch a rejected promise from an async route; without
+// this, one bad request in an async handler takes the whole process down.
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+
+// A trimmed, printable, bounded string, or null if it isn't one.
+function cleanLabel(value, max = MAX_NAME) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > max || CONTROL_CHARS.test(trimmed)) return null
+  return trimmed
+}
+
+function toId(value) {
+  const n = Number(value)
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
+const validMinutes = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= MAX_MINUTES
+
+// Optional booleans/strings in a PATCH: undefined (or null) means "leave it".
+const isAbsent = (v) => v === undefined || v === null
 
 // Off by default: express's IP detection trusts the LAST hop that talked to
 // it, which is correct for a direct connection but wrong behind a reverse
@@ -40,7 +73,10 @@ app.use(express.json({ limit: '2mb' }))
 // from X-Forwarded-For is used instead — never set this without one, since
 // without a proxy actually stripping/setting that header, a client could
 // just claim any IP it wants and dodge the limit entirely.
-if (process.env.TRUST_PROXY) app.set('trust proxy', 1)
+const trustProxy = process.env.TRUST_PROXY
+if (trustProxy && trustProxy !== '0' && trustProxy !== 'false') {
+  app.set('trust proxy', Number.isInteger(Number(trustProxy)) ? Number(trustProxy) : 1)
+}
 
 // Counts ALL attempts in the window, successful or not — simpler and more
 // robust than tracking failures only, and immune to the "lock someone else
@@ -50,18 +86,71 @@ if (process.env.TRUST_PROXY) app.set('trust proxy', 1)
 // should never realistically hit it.
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: Number(process.env.LOGIN_LIMIT) || 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Try again in a few minutes.' }
 })
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  limit: 10,
+  limit: Number(process.env.REGISTER_LIMIT) || 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many accounts created from this address. Try again later.' }
 })
+
+// Join codes are the only thing standing between a stranger and a server, and
+// /api/join needs no account, so guessing them has to be slow. Per IP, counting
+// every attempt.
+const joinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.JOIN_LIMIT) || 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many join attempts. Try again in a few minutes.' }
+})
+
+// --- Guests ---------------------------------------------------------------
+// Guests have no account, so they can't be muted or banned by account. What an
+// admin can do instead is revoke the join code they came in with. This map
+// (in memory, like presence) remembers each live guest's code and the voice
+// rooms they were handed tokens for, so revoking can disconnect them too. It
+// is only for that and for keeping guest names unique; whether a guest may
+// still get a token is decided by their signed token and the code's row.
+// identity -> { serverId, codeId, name, expiresAt, rooms: Set<string> }
+const guestSessions = new Map()
+
+function liveGuests() {
+  const now = Date.now()
+  for (const [identity, g] of guestSessions) {
+    if (g.expiresAt <= now) guestSessions.delete(identity)
+  }
+  return guestSessions
+}
+
+function guestNameTaken(serverId, name) {
+  const lower = name.toLowerCase()
+  for (const g of liveGuests().values()) {
+    if (g.serverId === serverId && g.name.toLowerCase() === lower) return true
+  }
+  return false
+}
+
+// Best-effort: end voice for these LiveKit rooms/participants. LiveKit being
+// unreachable must never make an admin action fail.
+function bestEffort(promise) {
+  return Promise.resolve(promise).catch(() => {})
+}
+
+async function disconnectGuests(match) {
+  const jobs = []
+  for (const [identity, g] of liveGuests()) {
+    if (!match(g)) continue
+    for (const room of g.rooms) jobs.push(bestEffort(roomService.removeParticipant(room, identity)))
+    guestSessions.delete(identity)
+  }
+  await Promise.all(jobs)
+}
 
 // --- Presence -----------------------------------------------------------
 // Who is currently "in" each channel/room. Kept in memory on purpose: a
@@ -437,6 +526,21 @@ async function sweepMemberships() {
   }
 }
 
+// A deleted server leaves nothing behind in memory, and anyone still on its
+// voice rooms is dropped (best-effort; the rooms themselves are gone either way).
+function forgetServer(serverId, voiceRooms) {
+  presence.forEach((space, key) => {
+    if (space.serverId === serverId) presence.delete(key)
+  })
+  proposals.forEach((p, id) => {
+    if (p.serverId === serverId) proposals.delete(id)
+  })
+  liveGuests().forEach((g, identity) => {
+    if (g.serverId === serverId) guestSessions.delete(identity)
+  })
+  for (const room of voiceRooms) bestEffort(roomService.deleteRoom(room))
+}
+
 function serializeTree(serverId) {
   const channels = db
     .prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, id')
@@ -466,20 +570,38 @@ app.get('/api/health', (req, res) => {
 
 // --- Accounts ---
 
-app.post('/api/register', registerLimiter, (req, res) => {
-  const { username, password } = req.body || {}
-  if (!username || !password || username.length < 3 || password.length < 8) {
-    return res
-      .status(400)
-      .json({ error: 'Username needs 3+ characters and password needs 8+ characters' })
+// Display names are matched by the clients (who is speaking, per-person volume),
+// so they have to be unambiguous: trimmed, printable, and unique ignoring case.
+function cleanUsername(value) {
+  const name = cleanLabel(value, 32)
+  return name && name.length >= 3 ? name : null
+}
+
+app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
+  const body = req.body || {}
+  const username = cleanUsername(body.username)
+  const password = body.password
+  if (!username) {
+    return res.status(400).json({ error: 'Username needs 3 to 32 printable characters' })
   }
-  const existing = db.prepare('SELECT id FROM accounts WHERE username = ?').get(username)
+  if (typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ error: 'Password needs 8+ characters' })
+  }
+  // bcrypt only reads the first 72 bytes, so a longer password would silently
+  // be a shorter one. Say so instead.
+  if (Buffer.byteLength(password) > 72) {
+    return res.status(400).json({ error: 'Password can be at most 72 bytes long' })
+  }
+
+  const hash = await hashPassword(password)
+
+  // Check and insert with no await in between, so two registrations for the
+  // same name can't both pass the check.
+  const existing = db.prepare('SELECT id FROM accounts WHERE username = ? COLLATE NOCASE').get(username)
   if (existing) return res.status(409).json({ error: 'That username is already taken' })
 
   const { count } = db.prepare('SELECT COUNT(*) as count FROM accounts').get()
   const isFirstAccount = count === 0
-
-  const hash = hashPassword(password)
   const info = db
     .prepare(
       'INSERT INTO accounts (username, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?)'
@@ -495,15 +617,24 @@ app.post('/api/register', registerLimiter, (req, res) => {
     isAdmin: !!account.is_admin,
     avatarUpdatedAt: account.avatar_updated_at || null
   })
-})
+}))
 
-app.post('/api/login', loginLimiter, (req, res) => {
-  const { username, password } = req.body || {}
-  if (!username || !password) {
+app.post('/api/login', loginLimiter, asyncHandler(async (req, res) => {
+  const body = req.body || {}
+  const username = typeof body.username === 'string' ? body.username.trim() : ''
+  const password = body.password
+  if (!username || typeof password !== 'string' || !password) {
     return res.status(400).json({ error: 'Username and password are required' })
   }
-  const account = db.prepare('SELECT * FROM accounts WHERE username = ?').get(username)
-  if (!account || !verifyPassword(password, account.password_hash)) {
+  // An exact match wins; otherwise ignore capitalization, so "alice" gets into
+  // "Alice" the way people expect.
+  const account =
+    db.prepare('SELECT * FROM accounts WHERE username = ?').get(username) ||
+    db.prepare('SELECT * FROM accounts WHERE username = ? COLLATE NOCASE').get(username)
+  const ok = account
+    ? await verifyPassword(password, account.password_hash)
+    : (await verifyAgainstNobody(password), false)
+  if (!ok) {
     return res.status(401).json({ error: 'Incorrect username or password' })
   }
   const token = signSession(account)
@@ -514,7 +645,7 @@ app.post('/api/login', loginLimiter, (req, res) => {
     isAdmin: !!account.is_admin,
     avatarUpdatedAt: account.avatar_updated_at || null
   })
-})
+}))
 
 app.get('/api/me', requireAuth, (req, res) => {
   const account = db.prepare('SELECT avatar_updated_at FROM accounts WHERE id = ?').get(req.account.sub)
@@ -608,18 +739,18 @@ app.get('/api/avatars/:accountId', (req, res) => {
 // --- Servers ---
 
 app.post('/api/servers', requireAuth, (req, res) => {
-  const { name } = req.body || {}
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Server name is required' })
+  const name = cleanLabel((req.body || {}).name)
+  if (!name) return res.status(400).json({ error: `Server name is required (up to ${MAX_NAME} characters)` })
 
   const now = Date.now()
   const info = db
     .prepare('INSERT INTO servers (name, owner_id, created_at) VALUES (?, ?, ?)')
-    .run(name.trim(), req.account.sub, now)
+    .run(name, req.account.sub, now)
   db.prepare(
     'INSERT INTO server_members (server_id, account_id, is_admin, joined_at) VALUES (?, ?, 1, ?)'
   ).run(info.lastInsertRowid, req.account.sub, now)
 
-  res.json({ id: info.lastInsertRowid, name: name.trim(), isAdmin: true })
+  res.json({ id: info.lastInsertRowid, name, isAdmin: true })
 })
 
 app.get('/api/servers', requireAuth, (req, res) => {
@@ -649,9 +780,9 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
 })
 
 app.patch('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
-  const { name } = req.body || {}
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Server name is required' })
-  db.prepare('UPDATE servers SET name = ? WHERE id = ?').run(name.trim(), req.params.id)
+  const name = cleanLabel((req.body || {}).name)
+  if (!name) return res.status(400).json({ error: `Server name is required (up to ${MAX_NAME} characters)` })
+  db.prepare('UPDATE servers SET name = ? WHERE id = ?').run(name, req.params.id)
   res.json({ updated: true })
 })
 
@@ -665,6 +796,10 @@ app.delete('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
     .all(id)
     .map((r) => r.id)
   const channelIds = db.prepare('SELECT id FROM channels WHERE server_id = ?').all(id).map((c) => c.id)
+  const voiceRooms = [
+    ...channelIds.map((cid) => `s${id}-channel-${cid}`),
+    ...roomIds.map((rid) => `s${id}-room-${rid}`)
+  ]
 
   const tx = db.transaction(() => {
     for (const roomId of roomIds) {
@@ -676,18 +811,23 @@ app.delete('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
     }
     db.prepare('DELETE FROM channels WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM join_codes WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM server_bans WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_members WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM servers WHERE id = ?').run(id)
   })
   tx()
+  forgetServer(Number(id), voiceRooms)
   res.json({ deleted: true })
 })
 
 // --- Channels ---
 
 app.post('/api/servers/:id/channels', requireAuth, requireServerAdmin, (req, res) => {
-  const { name, mode = 'both', persistent = false } = req.body || {}
-  if (!name || !name.trim()) return res.status(400).json({ error: 'Channel name is required' })
+  const { mode = 'both', persistent = false } = req.body || {}
+  const name = cleanLabel((req.body || {}).name)
+  if (!name) return res.status(400).json({ error: `Channel name is required (up to ${MAX_NAME} characters)` })
+  if (!MODES.has(mode)) return res.status(400).json({ error: 'mode must be voice, text, or both' })
+  if (typeof persistent !== 'boolean') return res.status(400).json({ error: 'persistent must be true or false' })
 
   const { maxPos } = db
     .prepare('SELECT COALESCE(MAX(position), -1) as maxPos FROM channels WHERE server_id = ?')
@@ -698,9 +838,9 @@ app.post('/api/servers/:id/channels', requireAuth, requireServerAdmin, (req, res
       `INSERT INTO channels (server_id, name, mode, persistent, position, created_at)
        VALUES (?, ?, ?, ?, ?, ?)`
     )
-    .run(req.params.id, name.trim(), mode, persistent ? 1 : 0, maxPos + 1, Date.now())
+    .run(req.params.id, name, mode, persistent ? 1 : 0, maxPos + 1, Date.now())
 
-  res.json({ id: info.lastInsertRowid, name: name.trim(), mode, persistent: !!persistent, rooms: [] })
+  res.json({ id: info.lastInsertRowid, name, mode, persistent, rooms: [] })
 })
 
 app.patch('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmin, (req, res) => {
@@ -709,7 +849,10 @@ app.patch('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmi
     .get(req.params.channelId, req.params.id)
   if (!channel) return res.status(404).json({ error: 'Channel not found' })
 
-  const { name, mode, persistent, position } = req.body || {}
+  const { name: rawName, mode, persistent, position } = req.body || {}
+  const patchError = validateSpacePatch({ name: rawName, mode, persistent, position })
+  if (patchError) return res.status(400).json({ error: patchError })
+  const name = isAbsent(rawName) ? undefined : rawName.trim()
   if (persistent === true && !channel.persistent && refuseIfOthersHaveWritten(res, 'channel', channel.id, 'channel')) return
   db.prepare(
     `UPDATE channels SET
@@ -721,7 +864,7 @@ app.patch('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmi
   ).run(
     name ?? null,
     mode ?? null,
-    persistent === undefined ? null : persistent ? 1 : 0,
+    isAbsent(persistent) ? null : persistent ? 1 : 0,
     position ?? null,
     channel.id
   )
@@ -746,8 +889,12 @@ app.delete('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdm
     db.prepare('DELETE FROM messages WHERE channel_id = ?').run(channel.id)
     db.prepare('DELETE FROM rooms WHERE channel_id = ?').run(channel.id)
     db.prepare('DELETE FROM channels WHERE id = ?').run(channel.id)
+    return roomIds
   })
-  tx()
+  const removedRoomIds = tx()
+  const sid = Number(req.params.id)
+  bestEffort(roomService.deleteRoom(`s${sid}-channel-${channel.id}`))
+  for (const rid of removedRoomIds) bestEffort(roomService.deleteRoom(`s${sid}-room-${rid}`))
   res.json({ deleted: true })
 })
 
@@ -763,8 +910,11 @@ app.post(
       .get(req.params.channelId, req.params.id)
     if (!channel) return res.status(404).json({ error: 'Channel not found' })
 
-    const { name, mode = 'both', persistent = false } = req.body || {}
-    if (!name || !name.trim()) return res.status(400).json({ error: 'Room name is required' })
+    const { mode = 'both', persistent = false } = req.body || {}
+    const name = cleanLabel((req.body || {}).name)
+    if (!name) return res.status(400).json({ error: `Room name is required (up to ${MAX_NAME} characters)` })
+    if (!MODES.has(mode)) return res.status(400).json({ error: 'mode must be voice, text, or both' })
+    if (typeof persistent !== 'boolean') return res.status(400).json({ error: 'persistent must be true or false' })
 
     const { maxPos } = db
       .prepare('SELECT COALESCE(MAX(position), -1) as maxPos FROM rooms WHERE channel_id = ?')
@@ -775,9 +925,9 @@ app.post(
         `INSERT INTO rooms (channel_id, name, mode, persistent, position, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(channel.id, name.trim(), mode, persistent ? 1 : 0, maxPos + 1, Date.now())
+      .run(channel.id, name, mode, persistent ? 1 : 0, maxPos + 1, Date.now())
 
-    res.json({ id: info.lastInsertRowid, name: name.trim(), mode, persistent: !!persistent })
+    res.json({ id: info.lastInsertRowid, name, mode, persistent })
   }
 )
 
@@ -794,7 +944,10 @@ app.patch(
       .get(req.params.roomId, req.params.channelId, req.params.id)
     if (!room) return res.status(404).json({ error: 'Room not found' })
 
-    const { name, mode, persistent, position } = req.body || {}
+    const { name: rawName, mode, persistent, position } = req.body || {}
+    const patchError = validateSpacePatch({ name: rawName, mode, persistent, position })
+    if (patchError) return res.status(400).json({ error: patchError })
+    const name = isAbsent(rawName) ? undefined : rawName.trim()
     if (persistent === true && !room.persistent && refuseIfOthersHaveWritten(res, 'room', room.id, 'room')) return
     db.prepare(
       `UPDATE rooms SET
@@ -806,7 +959,7 @@ app.patch(
     ).run(
       name ?? null,
       mode ?? null,
-      persistent === undefined ? null : persistent ? 1 : 0,
+      isAbsent(persistent) ? null : persistent ? 1 : 0,
       position ?? null,
       room.id
     )
@@ -830,6 +983,7 @@ app.delete(
 
     db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id)
     db.prepare('DELETE FROM rooms WHERE id = ?').run(room.id)
+    bestEffort(roomService.deleteRoom(`s${Number(req.params.id)}-room-${room.id}`))
     res.json({ deleted: true })
   }
 )
@@ -838,6 +992,12 @@ app.delete(
 
 app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) => {
   const { persistent = false, singleUse = true, expiresInMinutes = null } = req.body || {}
+  if (typeof persistent !== 'boolean' || typeof singleUse !== 'boolean') {
+    return res.status(400).json({ error: 'persistent and singleUse must be true or false' })
+  }
+  if (expiresInMinutes !== null && !validMinutes(expiresInMinutes)) {
+    return res.status(400).json({ error: 'expiresInMinutes must be a positive number of minutes, or null' })
+  }
 
   let code
   for (let attempt = 0; attempt < 10; attempt++) {
@@ -867,7 +1027,61 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
   res.json({ code, persistent: !!persistent, singleUse: !!singleUse, expiresAt })
 })
 
+// Codes still able to bring someone in, newest first, with how many guests
+// they have brought in who are still around.
+app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) => {
+  const now = Date.now()
+  const rows = db
+    .prepare(
+      `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at FROM join_codes
+       WHERE server_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > ?)
+         AND NOT (single_use = 1 AND used = 1)
+       ORDER BY id DESC`
+    )
+    .all(req.params.id, now)
+  const guestsByCode = new Map()
+  for (const g of liveGuests().values()) {
+    if (g.serverId === Number(req.params.id)) guestsByCode.set(g.codeId, (guestsByCode.get(g.codeId) || 0) + 1)
+  }
+  res.json({
+    codes: rows.map((r) => ({
+      id: r.id,
+      code: r.code,
+      persistent: !!r.persistent,
+      singleUse: !!r.single_use,
+      expiresAt: r.expires_at,
+      createdAt: r.created_at,
+      guestsNow: guestsByCode.get(r.id) || 0
+    }))
+  })
+})
+
+// Revoking a code stops it admitting anyone new AND ends the access of every
+// guest who came in with it: their next voice token is refused, and anyone
+// already in a voice room is disconnected. This is the way to remove a guest.
+// People who made an account through it keep their membership; use kick or ban
+// for those.
+app.delete('/api/servers/:id/codes/:codeId', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const codeId = toId(req.params.codeId)
+  const record = codeId && db.prepare('SELECT id FROM join_codes WHERE id = ? AND server_id = ?').get(codeId, req.params.id)
+  if (!record) return res.status(404).json({ error: 'Code not found' })
+  db.prepare('UPDATE join_codes SET revoked = 1 WHERE id = ?').run(codeId)
+  await disconnectGuests((g) => g.codeId === codeId)
+  res.json({ revoked: true })
+}))
+
 // --- Moderation: members, kick, ban, mute, timed access ---
+
+// Shared by the channel and room PATCH routes. Returns an error message, or null.
+function validateSpacePatch({ name, mode, persistent, position }) {
+  if (!isAbsent(name) && !cleanLabel(name)) return `name must be 1 to ${MAX_NAME} printable characters`
+  if (!isAbsent(mode) && !MODES.has(mode)) return 'mode must be voice, text, or both'
+  if (!isAbsent(persistent) && typeof persistent !== 'boolean') return 'persistent must be true or false'
+  if (!isAbsent(position) && !(Number.isInteger(position) && position >= 0)) {
+    return 'position must be a whole number, 0 or more'
+  }
+  return null
+}
 
 function serializeMember(row) {
   return {
@@ -910,19 +1124,49 @@ app.get('/api/servers/:id/bans', requireAuth, requireServerAdmin, (req, res) => 
   })
 })
 
-app.post('/api/servers/:id/members/:accountId/kick', requireAuth, requireServerAdmin, async (req, res) => {
+// Shared checks for moderation routes. Returns the target's id, or sends the
+// error response and returns null. The owner and other admins are off limits:
+// otherwise any admin could lock the owner out of their own server.
+function moderationTarget(req, res, { mustBeMember }) {
   const serverId = Number(req.params.id)
-  const targetId = Number(req.params.accountId)
-  if (targetId === req.account.sub) return res.status(400).json({ error: "You can't kick yourself" })
-  if (!getMembership(serverId, targetId)) return res.status(404).json({ error: 'Not a member of that server' })
+  const targetId = toId(req.params.accountId)
+  if (!targetId) {
+    res.status(400).json({ error: 'That is not a valid account' })
+    return null
+  }
+  if (targetId === req.account.sub) {
+    res.status(400).json({ error: "You can't moderate yourself" })
+    return null
+  }
+  if (!db.prepare('SELECT 1 FROM accounts WHERE id = ?').get(targetId)) {
+    res.status(404).json({ error: 'No such account' })
+    return null
+  }
+  const owner = db.prepare('SELECT owner_id FROM servers WHERE id = ?').get(serverId)
+  const membership = getMembership(serverId, targetId)
+  if ((owner && owner.owner_id === targetId) || (membership && membership.is_admin)) {
+    res.status(403).json({ error: "Admins and the server's owner can't be moderated" })
+    return null
+  }
+  if (mustBeMember && !membership) {
+    res.status(404).json({ error: 'Not a member of that server' })
+    return null
+  }
+  return targetId
+}
+
+app.post('/api/servers/:id/members/:accountId/kick', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const serverId = Number(req.params.id)
+  const targetId = moderationTarget(req, res, { mustBeMember: true })
+  if (!targetId) return
   await removeMember(serverId, targetId)
   res.json({ kicked: true })
-})
+}))
 
-app.post('/api/servers/:id/members/:accountId/ban', requireAuth, requireServerAdmin, async (req, res) => {
+app.post('/api/servers/:id/members/:accountId/ban', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
   const serverId = Number(req.params.id)
-  const targetId = Number(req.params.accountId)
-  if (targetId === req.account.sub) return res.status(400).json({ error: "You can't ban yourself" })
+  const targetId = moderationTarget(req, res, { mustBeMember: false })
+  if (!targetId) return
   const { reason } = req.body || {}
   db.prepare(
     `INSERT INTO server_bans (server_id, account_id, banned_by, reason, banned_at) VALUES (?, ?, ?, ?, ?)
@@ -930,24 +1174,30 @@ app.post('/api/servers/:id/members/:accountId/ban', requireAuth, requireServerAd
   ).run(serverId, targetId, req.account.sub, typeof reason === 'string' ? reason.slice(0, 300) : null, Date.now())
   if (getMembership(serverId, targetId)) await removeMember(serverId, targetId)
   res.json({ banned: true })
-})
+}))
 
 app.delete('/api/servers/:id/bans/:accountId', requireAuth, requireServerAdmin, (req, res) => {
-  db.prepare('DELETE FROM server_bans WHERE server_id = ? AND account_id = ?').run(req.params.id, req.params.accountId)
+  const targetId = toId(req.params.accountId)
+  if (!targetId) return res.status(400).json({ error: 'That is not a valid account' })
+  db.prepare('DELETE FROM server_bans WHERE server_id = ? AND account_id = ?').run(req.params.id, targetId)
   res.json({ unbanned: true })
 })
 
 // Mute/unmute and/or set or clear a timed access window, independent of
 // however they originally joined. accessExpiresInMinutes: a number sets it
 // to now+minutes, null clears it (permanent access), omitted leaves it as is.
-app.patch('/api/servers/:id/members/:accountId', requireAuth, requireServerAdmin, async (req, res) => {
+app.patch('/api/servers/:id/members/:accountId', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
   const serverId = Number(req.params.id)
-  const targetId = Number(req.params.accountId)
-  if (targetId === req.account.sub) return res.status(400).json({ error: "You can't moderate yourself" })
-  const membership = getMembership(serverId, targetId)
-  if (!membership) return res.status(404).json({ error: 'Not a member of that server' })
+  const targetId = moderationTarget(req, res, { mustBeMember: true })
+  if (!targetId) return
 
   const { muted, accessExpiresInMinutes } = req.body || {}
+  if (muted !== undefined && typeof muted !== 'boolean') {
+    return res.status(400).json({ error: 'muted must be true or false' })
+  }
+  if (accessExpiresInMinutes !== undefined && accessExpiresInMinutes !== null && !validMinutes(accessExpiresInMinutes)) {
+    return res.status(400).json({ error: 'accessExpiresInMinutes must be a positive number of minutes, or null' })
+  }
   if (typeof muted === 'boolean') {
     db.prepare('UPDATE server_members SET muted = ? WHERE server_id = ? AND account_id = ?').run(
       muted ? 1 : 0,
@@ -958,7 +1208,7 @@ app.patch('/api/servers/:id/members/:accountId', requireAuth, requireServerAdmin
   }
   if (accessExpiresInMinutes !== undefined) {
     const expiresAt =
-      accessExpiresInMinutes === null ? null : Date.now() + Number(accessExpiresInMinutes) * 60 * 1000
+      accessExpiresInMinutes === null ? null : Date.now() + accessExpiresInMinutes * 60 * 1000
     db.prepare('UPDATE server_members SET access_expires_at = ? WHERE server_id = ? AND account_id = ?').run(
       expiresAt,
       serverId,
@@ -968,20 +1218,34 @@ app.patch('/api/servers/:id/members/:accountId', requireAuth, requireServerAdmin
   const updated = getMembership(serverId, targetId)
   const account = db.prepare('SELECT username FROM accounts WHERE id = ?').get(targetId)
   res.json({ member: serializeMember({ ...updated, username: account.username }) })
-})
+}))
 
-app.post('/api/servers/join', requireAuth, (req, res) => {
-  const { code } = req.body || {}
-  if (!code) return res.status(400).json({ error: 'Code is required' })
-
-  const record = db.prepare('SELECT * FROM join_codes WHERE code = ?').get(code)
-  if (!record) return res.status(404).json({ error: 'That code was not recognized' })
+// Looks a code up and checks it can still be used. Returns the row, or sends
+// the error response and returns null.
+function usableCode(res, code) {
+  if (typeof code !== 'string' || !code.trim() || code.length > 64) {
+    res.status(400).json({ error: 'Code is required' })
+    return null
+  }
+  const record = db.prepare('SELECT * FROM join_codes WHERE code = ?').get(code.trim())
+  if (!record || record.revoked) {
+    res.status(404).json({ error: 'That code was not recognized' })
+    return null
+  }
   if (record.expires_at && Date.now() > record.expires_at) {
-    return res.status(410).json({ error: 'That code has expired' })
+    res.status(410).json({ error: 'That code has expired' })
+    return null
   }
   if (record.single_use && record.used) {
-    return res.status(410).json({ error: 'That code has already been used' })
+    res.status(410).json({ error: 'That code has already been used' })
+    return null
   }
+  return record
+}
+
+app.post('/api/servers/join', joinLimiter, requireAuth, (req, res) => {
+  const record = usableCode(res, (req.body || {}).code)
+  if (!record) return
 
   if (isBanned(record.server_id, req.account.sub)) {
     return res.status(403).json({ error: 'You were banned from that server' })
@@ -993,7 +1257,8 @@ app.post('/api/servers/join', requireAuth, (req, res) => {
       'INSERT INTO server_members (server_id, account_id, is_admin, joined_at, access_expires_at) VALUES (?, ?, 0, ?, ?)'
     ).run(record.server_id, req.account.sub, Date.now(), record.expires_at || null)
   }
-  if (record.single_use) {
+  // Someone who is already in doesn't use the code up.
+  if (record.single_use && !already) {
     db.prepare('UPDATE join_codes SET used = 1 WHERE id = ?').run(record.id)
   }
 
@@ -1003,20 +1268,24 @@ app.post('/api/servers/join', requireAuth, (req, res) => {
 
 // --- Joining (anonymous, via code — no account, no persistent membership) ---
 
-app.post('/api/join', async (req, res) => {
-  const { code } = req.body || {}
-  const screenName = typeof req.body?.screenName === 'string' ? req.body.screenName.trim().slice(0, 32) : ''
-  if (!code || !screenName) {
+app.post('/api/join', joinLimiter, (req, res) => {
+  const body = req.body || {}
+  const screenName = cleanLabel(body.screenName, 32)
+  if (typeof body.code !== 'string' || !body.code.trim() || !screenName) {
     return res.status(400).json({ error: 'Code and screen name are required' })
   }
 
-  const record = db.prepare('SELECT * FROM join_codes WHERE code = ?').get(code)
-  if (!record) return res.status(404).json({ error: 'That code was not recognized' })
-  if (record.expires_at && Date.now() > record.expires_at) {
-    return res.status(410).json({ error: 'That code has expired' })
+  const record = usableCode(res, body.code)
+  if (!record) return
+
+  // A guest can't borrow the name of an account (that includes accounts that
+  // were muted or banned, who could otherwise come straight back unrecognized),
+  // or of another guest who is currently in this server.
+  if (db.prepare('SELECT 1 FROM accounts WHERE username = ? COLLATE NOCASE').get(screenName)) {
+    return res.status(409).json({ error: 'That name belongs to an account. Pick a different screen name.' })
   }
-  if (record.single_use && record.used) {
-    return res.status(410).json({ error: 'That code has already been used' })
+  if (guestNameTaken(record.server_id, screenName)) {
+    return res.status(409).json({ error: 'Someone here is already using that name. Pick a different one.' })
   }
 
   if (record.single_use) {
@@ -1024,9 +1293,24 @@ app.post('/api/join', async (req, res) => {
   }
 
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(record.server_id)
-  const identity = `guest-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const identity = `guest-${randomBytes(9).toString('base64url')}`
+  // A guest's access never outlasts the code it came from.
+  const lifetimeMs = Math.min(12 * 60 * 60 * 1000, record.expires_at ? record.expires_at - Date.now() : Infinity)
+  guestSessions.set(identity, {
+    serverId: server.id,
+    codeId: record.id,
+    name: screenName,
+    expiresAt: Date.now() + lifetimeMs,
+    rooms: new Set()
+  })
   res.json({
-    guestToken: signGuest({ serverId: server.id, screenName, identity }),
+    guestToken: signGuest({
+      serverId: server.id,
+      screenName,
+      identity,
+      codeId: record.id,
+      expiresInSeconds: lifetimeMs / 1000
+    }),
     screenName,
     server: {
       id: server.id,
@@ -1055,7 +1339,7 @@ function lookupSpace(type, id) {
         .get(id)
 }
 
-app.post('/api/voice/token', requireAuthOrGuest, async (req, res) => {
+app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) => {
   const { type, id } = req.body || {}
   const spaceId = Number(id)
   if ((type !== 'channel' && type !== 'room') || !Number.isInteger(spaceId)) {
@@ -1072,6 +1356,11 @@ app.post('/api/voice/token', requireAuthOrGuest, async (req, res) => {
     if (req.guest.serverId !== space.server_id) {
       return res.status(403).json({ error: "You weren't invited to that server" })
     }
+    // The code they came in with must still be good: revoking it ends their access.
+    const code = db.prepare('SELECT revoked FROM join_codes WHERE id = ?').get(req.guest.codeId)
+    if (!code || code.revoked) {
+      return res.status(403).json({ error: 'Your invite was revoked' })
+    }
     identity = req.guest.identity
     name = req.guest.screenName
   } else {
@@ -1086,8 +1375,24 @@ app.post('/api/voice/token', requireAuthOrGuest, async (req, res) => {
 
   const room = `s${space.server_id}-${type}-${spaceId}`
   const token = await mintLiveKitToken(identity, name, room, !mutedOnJoin)
+  if (req.guest) {
+    // Remember the room, so revoking the invite can pull them out of it. After a
+    // restart this is rebuilt as guests ask for tokens again.
+    let session = liveGuests().get(identity)
+    if (!session) {
+      session = {
+        serverId: req.guest.serverId,
+        codeId: req.guest.codeId,
+        name,
+        expiresAt: req.guest.exp * 1000,
+        rooms: new Set()
+      }
+      guestSessions.set(identity, session)
+    }
+    session.rooms.add(room)
+  }
   res.json({ token, livekitUrl: LIVEKIT_URL, room })
-})
+}))
 
 // --- Messages (persisted; no real-time push yet — that needs presence) ---
 
@@ -1289,6 +1594,26 @@ app.delete('/api/proposals/:proposalId', requireAuth, (req, res) => {
   if (!p || p.proposerId !== req.account.sub) return res.status(404).json({ error: 'No such vote' })
   if (p.status === 'open') closeProposal(p, 'cancelled')
   res.json({ proposal: proposalView(p, req.account.sub) })
+})
+
+// Anything that slipped through becomes a plain error response. Unknown API
+// paths and bad JSON bodies get proper JSON answers instead of Express's HTML.
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }))
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err)
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The request body was not valid JSON' })
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'The request was too large' })
+  console.error(`${req.method} ${req.originalUrl}:`, err)
+  res.status(500).json({ error: 'Something went wrong on the server' })
+})
+
+// A bug in a background task shouldn't take everyone's voice and chat down with
+// it. An exception outside any request leaves the process in an unknown state,
+// though, so that one still exits and lets systemd start it fresh.
+process.on('unhandledRejection', (err) => console.error('unhandledRejection:', err))
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err)
+  process.exit(1)
 })
 
 const PORT = process.env.PORT || 4000

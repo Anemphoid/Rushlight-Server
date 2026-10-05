@@ -135,6 +135,36 @@ export const migrations = [
         );
       `)
     }
+  },
+  {
+    id: 5,
+    name: 'usernames are unique regardless of capitalization',
+    up(db) {
+      // Registration now refuses "alice" when "Alice" exists. This index makes
+      // the database enforce it too. If an existing install already has two
+      // accounts that differ only by case, the index can't be built; rather
+      // than refuse to start over that, skip it. The application check still
+      // applies to every new registration.
+      const clashes = db
+        .prepare('SELECT lower(username) AS name, COUNT(*) AS n FROM accounts GROUP BY lower(username) HAVING n > 1')
+        .all()
+      if (clashes.length > 0) {
+        console.warn(
+          `Skipping the case-insensitive username index: ${clashes
+            .map((c) => c.name)
+            .join(', ')} exist(s) more than once with different capitalization.`
+        )
+        return
+      }
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_username_nocase ON accounts(username COLLATE NOCASE)')
+    }
+  },
+  {
+    id: 6,
+    name: 'revocable join codes',
+    up(db) {
+      db.exec('ALTER TABLE join_codes ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0')
+    }
   }
 ]
 
