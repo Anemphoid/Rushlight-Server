@@ -37,7 +37,14 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   a guest cannot use any account's name or a live guest's name, a guest token
   never outlives its code, and revoking a code ends access for everyone who came
   in with it (token refused, live voice disconnected).
-- The server owner and other admins cannot be kicked, banned or muted.
+- The server owner and other admins cannot be kicked, banned or muted, and the
+  expiry sweep skips them even if a stray expiry is on their row.
+- Kick, ban and expiry all go through `removeMember`, which deletes the
+  membership, records why in `access_ends` (so the 403 can say `reason`), asks
+  LiveKit to disconnect first and only then clears presence. Keep that order.
+- A guest session ending (code expiry or the 12 hour cap) also drops the guest from
+  their voice rooms; `endGuestSession` does it, and the sweep calls `liveGuests()`
+  so it happens without anyone making a request.
 - Presence, open votes and the guest-session map are in memory on purpose; a
   restart clears ephemeral history anyway.
 - Foreign key enforcement is off (as it has always been); deletes clean up their

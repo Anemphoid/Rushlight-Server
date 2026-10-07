@@ -165,6 +165,26 @@ export const migrations = [
     up(db) {
       db.exec('ALTER TABLE join_codes ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0')
     }
+  },
+  {
+    id: 7,
+    name: 'remember why someone lost access to a server',
+    up(db) {
+      // Removing a member deletes their membership row, so afterwards nothing says
+      // whether they expired, were kicked or were banned. This keeps that one fact,
+      // so the person can be told plainly instead of getting a generic error.
+      // Joining again clears it; old rows are tidied up after a month.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS access_ends (
+          server_id INTEGER NOT NULL,
+          account_id INTEGER NOT NULL,
+          reason TEXT NOT NULL,
+          ended_at INTEGER NOT NULL,
+          PRIMARY KEY (server_id, account_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_access_ends_ended_at ON access_ends(ended_at);
+      `)
+    }
   }
 ]
 
