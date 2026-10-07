@@ -180,9 +180,23 @@ admins can't be moderated at all**, so an admin can't lock the owner out.
   voice token they request can't publish, and if they're already connected their
   live LiveKit permissions are updated on the spot.
 - **Timed access** (`PATCH .../members/:accountId` with `{ accessExpiresInMinutes }`,
-  or `null` to clear it) can be set directly on anyone. Joining with a code that has
-  its own expiry gives the new membership that same expiry. A background sweep
-  removes anyone whose time has run out.
+  or `null` to clear it) can be set directly on any ordinary member. Joining with a
+  code that has its own expiry gives the new membership that same expiry. A
+  background sweep removes anyone whose time has run out, exactly as a kick would:
+  the membership goes, LiveKit is told to disconnect them first, and then their
+  presence is cleared. They are not banned and can come back with a new code. The
+  owner and other admins never expire, whatever is on their row.
+- **Guests and expiry.** A guest's session ends when their code expires (or after 12
+  hours, whichever is first), and ending it drops them from the voice rooms they
+  were in, the same way revoking the code does. Guest sessions are kept in memory,
+  so a server restart forgets who is connected. A guest who was already in a call
+  before a restart is not dropped when their code expires, but their token stops
+  working at that moment, so they can't rejoin.
+- **Telling people why.** When someone who used to be a member asks for the server,
+  the 403 says why: `reason` is `expired`, `removed` or `banned`, with a plain
+  `error` message. It is remembered for 30 days or until they join again, and
+  only that person sees it. Someone who was never a member gets the usual message
+  with no `reason`.
 
 The force-disconnect and the live mute are best effort: they're driven by presence,
 so they only reach someone who has a client open and checking in. Removing the

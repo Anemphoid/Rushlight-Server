@@ -120,10 +120,19 @@ const joinLimiter = rateLimit({
 // identity -> { serverId, codeId, name, expiresAt, rooms: Set<string> }
 const guestSessions = new Map()
 
+// A guest's session ends when their token does: at the join code's own expiry,
+// or after 12 hours, whichever comes first. Ending it also drops them from the
+// voice rooms they were handed tokens for, because LiveKit only checks a token
+// when someone connects and would otherwise leave them in the call.
+function endGuestSession(identity, g) {
+  guestSessions.delete(identity)
+  for (const room of g.rooms) bestEffort(roomService.removeParticipant(room, identity))
+}
+
 function liveGuests() {
   const now = Date.now()
   for (const [identity, g] of guestSessions) {
-    if (g.expiresAt <= now) guestSessions.delete(identity)
+    if (g.expiresAt <= now) endGuestSession(identity, g)
   }
   return guestSessions
 }
@@ -434,14 +443,14 @@ function getMembership(serverId, accountId) {
 
 function requireServerMember(req, res, next) {
   const membership = getMembership(req.params.id, req.account.sub)
-  if (!membership) return res.status(403).json({ error: "You're not a member of that server" })
+  if (!membership) return notAMember(res, req.params.id, req.account.sub)
   req.membership = membership
   next()
 }
 
 function requireServerAdmin(req, res, next) {
   const membership = getMembership(req.params.id, req.account.sub)
-  if (!membership) return res.status(403).json({ error: "You're not a member of that server" })
+  if (!membership) return notAMember(res, req.params.id, req.account.sub)
   if (!membership.is_admin) return res.status(403).json({ error: 'Admin only' })
   req.membership = membership
   next()
@@ -481,9 +490,14 @@ async function disconnectFromServerVoice(serverId, accountId) {
   }
 }
 
-// Kick and ban share everything except the ban record itself.
-async function removeMember(serverId, accountId) {
+// Kick, ban and expiry share this; they differ in the ban record and in the
+// reason remembered for the person ('removed', 'banned' or 'expired').
+async function removeMember(serverId, accountId, reason = 'removed') {
   db.prepare('DELETE FROM server_members WHERE server_id = ? AND account_id = ?').run(serverId, accountId)
+  db.prepare(
+    `INSERT INTO access_ends (server_id, account_id, reason, ended_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (server_id, account_id) DO UPDATE SET reason = excluded.reason, ended_at = excluded.ended_at`
+  ).run(serverId, accountId, reason, Date.now())
   // Order matters: this reads presence to know which room to disconnect
   // them from, so it has to run before that data gets wiped below.
   await disconnectFromServerVoice(serverId, accountId)
@@ -518,12 +532,41 @@ async function applyLiveMute(serverId, accountId, muted) {
 // sweep interval as presence and votes.
 async function sweepMemberships() {
   const now = Date.now()
+  // Admins and the owner never expire, whatever is on their row: only ordinary
+  // members can be given a timer, and this stops a stray value locking an owner out.
   const expired = db
-    .prepare('SELECT server_id, account_id FROM server_members WHERE access_expires_at IS NOT NULL AND access_expires_at <= ?')
+    .prepare(
+      `SELECT server_id, account_id FROM server_members
+       WHERE access_expires_at IS NOT NULL AND access_expires_at <= ? AND is_admin = 0
+         AND account_id NOT IN (SELECT owner_id FROM servers WHERE servers.id = server_members.server_id)`
+    )
     .all(now)
   for (const row of expired) {
-    await removeMember(row.server_id, row.account_id)
+    await removeMember(row.server_id, row.account_id, 'expired')
   }
+  liveGuests() // ends the sessions of guests whose code has run out, and drops them from voice
+}
+
+const ACCESS_ENDED_MESSAGE = {
+  expired: 'Your access to this server has expired.',
+  removed: 'You were removed from this server.',
+  banned: 'You were banned from this server.'
+}
+
+// The 403 for someone who is not a member. If they used to be, say why they are not.
+function notAMember(res, serverId, accountId) {
+  const row = db
+    .prepare('SELECT reason FROM access_ends WHERE server_id = ? AND account_id = ?')
+    .get(Number(serverId), accountId)
+  if (row && ACCESS_ENDED_MESSAGE[row.reason]) {
+    return res.status(403).json({ error: ACCESS_ENDED_MESSAGE[row.reason], reason: row.reason })
+  }
+  return res.status(403).json({ error: "You're not a member of that server" })
+}
+
+// Old records are not needed for long.
+function purgeOldAccessEnds() {
+  db.prepare('DELETE FROM access_ends WHERE ended_at < ?').run(Date.now() - 30 * 24 * 60 * 60 * 1000)
 }
 
 // A deleted server leaves nothing behind in memory, and anyone still on its
@@ -812,6 +855,7 @@ app.delete('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
     db.prepare('DELETE FROM channels WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM join_codes WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_bans WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM access_ends WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_members WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM servers WHERE id = ?').run(id)
   })
@@ -1159,7 +1203,7 @@ app.post('/api/servers/:id/members/:accountId/kick', requireAuth, requireServerA
   const serverId = Number(req.params.id)
   const targetId = moderationTarget(req, res, { mustBeMember: true })
   if (!targetId) return
-  await removeMember(serverId, targetId)
+  await removeMember(serverId, targetId, 'removed')
   res.json({ kicked: true })
 }))
 
@@ -1172,7 +1216,13 @@ app.post('/api/servers/:id/members/:accountId/ban', requireAuth, requireServerAd
     `INSERT INTO server_bans (server_id, account_id, banned_by, reason, banned_at) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT (server_id, account_id) DO UPDATE SET banned_by = excluded.banned_by, reason = excluded.reason, banned_at = excluded.banned_at`
   ).run(serverId, targetId, req.account.sub, typeof reason === 'string' ? reason.slice(0, 300) : null, Date.now())
-  if (getMembership(serverId, targetId)) await removeMember(serverId, targetId)
+  if (getMembership(serverId, targetId)) await removeMember(serverId, targetId, 'banned')
+  else {
+    db.prepare(
+      `INSERT INTO access_ends (server_id, account_id, reason, ended_at) VALUES (?, ?, 'banned', ?)
+       ON CONFLICT (server_id, account_id) DO UPDATE SET reason = 'banned', ended_at = excluded.ended_at`
+    ).run(serverId, targetId, Date.now())
+  }
   res.json({ banned: true })
 }))
 
@@ -1256,6 +1306,7 @@ app.post('/api/servers/join', joinLimiter, requireAuth, (req, res) => {
     db.prepare(
       'INSERT INTO server_members (server_id, account_id, is_admin, joined_at, access_expires_at) VALUES (?, ?, 0, ?, ?)'
     ).run(record.server_id, req.account.sub, Date.now(), record.expires_at || null)
+    db.prepare('DELETE FROM access_ends WHERE server_id = ? AND account_id = ?').run(record.server_id, req.account.sub)
   }
   // Someone who is already in doesn't use the code up.
   if (record.single_use && !already) {
@@ -1365,9 +1416,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
     name = req.guest.screenName
   } else {
     const membership = getMembership(space.server_id, req.account.sub)
-    if (!membership) {
-      return res.status(403).json({ error: "You're not a member of that server" })
-    }
+    if (!membership) return notAMember(res, space.server_id, req.account.sub)
     identity = `acct-${req.account.sub}`
     name = req.account.username
     mutedOnJoin = !!membership.muted
@@ -1427,9 +1476,7 @@ function requireSpaceMember(kind, param) {
   return (req, res, next) => {
     const serverId = serverIdForSpace(kind, req.params[param])
     if (!serverId) return res.status(404).json({ error: 'Not found' })
-    if (!getMembership(serverId, req.account.sub)) {
-      return res.status(403).json({ error: "You're not a member of that server" })
-    }
+    if (!getMembership(serverId, req.account.sub)) return notAMember(res, serverId, req.account.sub)
     next()
   }
 }
@@ -1504,9 +1551,7 @@ app.post('/api/presence', requireAuth, (req, res) => {
   }
   const serverId = serverIdForSpace(type, spaceId)
   if (!serverId) return res.status(404).json({ error: 'Not found' })
-  if (!getMembership(serverId, req.account.sub)) {
-    return res.status(403).json({ error: "You're not a member of that server" })
-  }
+  if (!getMembership(serverId, req.account.sub)) return notAMember(res, serverId, req.account.sub)
   recordPresence({ type, id: spaceId, serverId, account: req.account, avatarColor })
   res.json({ presence: presenceForServer(serverId) })
 })
@@ -1618,6 +1663,8 @@ process.on('uncaughtException', (err) => {
 
 const PORT = process.env.PORT || 4000
 const wiped = wipeAllEphemeralOnStartup()
+purgeOldAccessEnds()
+setInterval(purgeOldAccessEnds, 60 * 60 * 1000).unref()
 setInterval(() => {
   sweepPresence()
   sweepProposals()
