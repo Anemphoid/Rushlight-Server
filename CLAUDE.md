@@ -48,6 +48,11 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
 - A guest session ending (code expiry or the 12 hour cap) also drops the guest from
   their voice rooms; `endGuestSession` does it, and the sweep calls `liveGuests()`
   so it happens without anyone making a request.
+- Join codes may carry `scope_type`/`scope_id` (migration 8; null = whole server).
+  Every guest path that picks a space (voice token, presence) must go through
+  `guestCodeOrRefuse` + `scopeAllows`, and the guest's tree comes from
+  `serializeTree(serverId, scopeOf(code))`. Scoped codes never make an account a
+  member. Deleting a channel/room must `await revokeCodesScopedTo(...)`.
 - Presence, open votes and the guest-session map are in memory on purpose; a
   restart clears ephemeral history anyway.
 - Foreign key enforcement is off (as it has always been); deletes clean up their
