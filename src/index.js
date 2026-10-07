@@ -620,7 +620,11 @@ function forgetServer(serverId, voiceRooms) {
   for (const room of voiceRooms) bestEffort(roomService.deleteRoom(room))
 }
 
-function serializeTree(serverId) {
+// scope narrows the tree to what a scoped guest code covers: { type, id } for one
+// channel (with its rooms) or one room. A room's channel is shown only as the place
+// it sits, marked joinable: false, so the guest sees a way to the one room and
+// nothing else. Members never pass a scope and get the whole tree, unchanged.
+function serializeTree(serverId, scope = null) {
   const channels = db
     .prepare('SELECT * FROM channels WHERE server_id = ? ORDER BY position, id')
     .all(serverId)
@@ -632,7 +636,7 @@ function serializeTree(serverId) {
     )
     .all(serverId)
 
-  return channels.map((ch) => ({
+  const tree = channels.map((ch) => ({
     id: ch.id,
     name: ch.name,
     mode: ch.mode,
@@ -641,6 +645,11 @@ function serializeTree(serverId) {
       .filter((r) => r.channel_id === ch.id)
       .map((r) => ({ id: r.id, name: r.name, mode: r.mode, persistent: !!r.persistent }))
   }))
+  if (!scope) return tree
+  if (scope.type === 'channel') return tree.filter((ch) => ch.id === scope.id)
+  return tree
+    .filter((ch) => ch.rooms.some((r) => r.id === scope.id))
+    .map((ch) => ({ ...ch, joinable: false, rooms: ch.rooms.filter((r) => r.id === scope.id) }))
 }
 
 app.get('/api/health', (req, res) => {
@@ -952,7 +961,7 @@ app.patch('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmi
   res.json({ updated: true })
 })
 
-app.delete('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmin, (req, res) => {
+app.delete('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
   const channel = db
     .prepare('SELECT * FROM channels WHERE id = ? AND server_id = ?')
     .get(req.params.channelId, req.params.id)
@@ -975,8 +984,9 @@ app.delete('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdm
   const sid = Number(req.params.id)
   bestEffort(roomService.deleteRoom(`s${sid}-channel-${channel.id}`))
   for (const rid of removedRoomIds) bestEffort(roomService.deleteRoom(`s${sid}-room-${rid}`))
+  await revokeCodesScopedTo({ serverId: sid, channelId: channel.id, roomIds: removedRoomIds })
   res.json({ deleted: true })
-})
+}))
 
 // --- Rooms ---
 
@@ -1052,7 +1062,7 @@ app.delete(
   '/api/servers/:id/channels/:channelId/rooms/:roomId',
   requireAuth,
   requireServerAdmin,
-  (req, res) => {
+  asyncHandler(async (req, res) => {
     const room = db
       .prepare(
         `SELECT rooms.* FROM rooms JOIN channels ON rooms.channel_id = channels.id
@@ -1064,8 +1074,9 @@ app.delete(
     db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id)
     db.prepare('DELETE FROM rooms WHERE id = ?').run(room.id)
     bestEffort(roomService.deleteRoom(`s${Number(req.params.id)}-room-${room.id}`))
+    await revokeCodesScopedTo({ serverId: Number(req.params.id), roomIds: [room.id] })
     res.json({ deleted: true })
-  }
+  })
 )
 
 // --- Server-scoped join codes ---
@@ -1077,6 +1088,28 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
   }
   if (expiresInMinutes !== null && !validMinutes(expiresInMinutes)) {
     return res.status(400).json({ error: 'expiresInMinutes must be a positive number of minutes, or null' })
+  }
+
+  // Optional scope: { type: 'channel' | 'room', id }. Left out, the code covers the
+  // whole server. A scoped code is for guests only, and guests only use voice.
+  let scope = null
+  const scopeIn = (req.body || {}).scope
+  if (scopeIn !== undefined && scopeIn !== null) {
+    const type = scopeIn && scopeIn.type
+    const sid = scopeIn && Number(scopeIn.id)
+    if ((type !== 'channel' && type !== 'room') || !Number.isInteger(sid) || sid <= 0) {
+      return res.status(400).json({
+        error: 'scope must be { type: "channel" or "room", id: a number }, or left out for the whole server'
+      })
+    }
+    const space = lookupSpace(type, sid)
+    if (!space || space.server_id !== Number(req.params.id)) {
+      return res.status(400).json({ error: `That ${type} is not in this server` })
+    }
+    if (space.mode === 'text') {
+      return res.status(400).json({ error: 'Guests can only join voice, and that space has no voice' })
+    }
+    scope = { type, id: sid }
   }
 
   let code
@@ -1092,8 +1125,8 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
 
   const expiresAt = expiresInMinutes ? Date.now() + expiresInMinutes * 60 * 1000 : null
   db.prepare(
-    `INSERT INTO join_codes (code, server_id, created_by, persistent, single_use, expires_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO join_codes (code, server_id, created_by, persistent, single_use, expires_at, created_at, scope_type, scope_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     code,
     req.params.id,
@@ -1101,10 +1134,18 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
     persistent ? 1 : 0,
     singleUse ? 1 : 0,
     expiresAt,
-    Date.now()
+    Date.now(),
+    scope ? scope.type : null,
+    scope ? scope.id : null
   )
 
-  res.json({ code, persistent: !!persistent, singleUse: !!singleUse, expiresAt })
+  res.json({
+    code,
+    persistent: !!persistent,
+    singleUse: !!singleUse,
+    expiresAt,
+    scope: scope ? { ...scope, name: scopeName(scope) } : null
+  })
 })
 
 // Codes still able to bring someone in, newest first, with how many guests
@@ -1113,7 +1154,7 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
   const now = Date.now()
   const rows = db
     .prepare(
-      `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at FROM join_codes
+      `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at, scope_type, scope_id FROM join_codes
        WHERE server_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > ?)
          AND NOT (single_use = 1 AND used = 1)
        ORDER BY id DESC`
@@ -1124,15 +1165,18 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
     if (g.serverId === Number(req.params.id)) guestsByCode.set(g.codeId, (guestsByCode.get(g.codeId) || 0) + 1)
   }
   res.json({
-    codes: rows.map((r) => ({
-      id: r.id,
-      code: r.code,
-      persistent: !!r.persistent,
-      singleUse: !!r.single_use,
-      expiresAt: r.expires_at,
-      createdAt: r.created_at,
-      guestsNow: guestsByCode.get(r.id) || 0
-    }))
+    codes: rows
+      .filter((r) => scopeTargetExists(r)) // a code for a deleted channel or room is dead
+      .map((r) => ({
+        id: r.id,
+        code: r.code,
+        persistent: !!r.persistent,
+        singleUse: !!r.single_use,
+        expiresAt: r.expires_at,
+        createdAt: r.created_at,
+        guestsNow: guestsByCode.get(r.id) || 0,
+        scope: r.scope_type ? { type: r.scope_type, id: r.scope_id, name: scopeName(scopeOf(r)) } : null
+      }))
   })
 })
 
@@ -1333,6 +1377,16 @@ app.post('/api/servers/join', joinLimiter, requireAuth, (req, res) => {
   const record = usableCode(res, (req.body || {}).code)
   if (!record) return
 
+  // A code for one channel or room only lets guests in. Refused before anything is
+  // used up, so the code still works for the guest it was made for.
+  if (record.scope_type) {
+    return res.status(403).json({
+      error:
+        `That code is a guest invite for one ${record.scope_type}, so it can't make you a member. ` +
+        'Ask for a server invite to join the whole server.'
+    })
+  }
+
   if (isBanned(record.server_id, req.account.sub)) {
     return res.status(403).json({ error: 'You were banned from that server' })
   }
@@ -1404,7 +1458,7 @@ app.post('/api/join', joinLimiter, (req, res) => {
       id: server.id,
       name: server.name,
       isAdmin: false,
-      channels: serializeTree(server.id),
+      channels: serializeTree(server.id, scopeOf(record)),
       presence: {} // a guest sees who is in their own space once they are in one
     }
   })
@@ -1418,13 +1472,86 @@ app.post('/api/join', joinLimiter, (req, res) => {
 
 function lookupSpace(type, id) {
   return type === 'channel'
-    ? db.prepare('SELECT server_id, mode FROM channels WHERE id = ?').get(id)
+    ? db.prepare('SELECT server_id, mode, id AS channel_id FROM channels WHERE id = ?').get(id)
     : db
         .prepare(
-          `SELECT channels.server_id AS server_id, rooms.mode AS mode FROM rooms
+          `SELECT channels.server_id AS server_id, rooms.mode AS mode, rooms.channel_id AS channel_id FROM rooms
            JOIN channels ON rooms.channel_id = channels.id WHERE rooms.id = ?`
         )
         .get(id)
+}
+
+// --- Scoped join codes -----------------------------------------------------
+// A code can be limited to one channel (that channel and the rooms in it) or one
+// room. No scope means the whole server, as every code was before. The server
+// enforces this on the guest's voice token and presence check-in; hiding things
+// in the tree is only a courtesy.
+
+function scopeTargetExists(code) {
+  if (!code.scope_type) return true
+  const table = code.scope_type === 'channel' ? 'channels' : 'rooms'
+  return !!db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(code.scope_id)
+}
+
+function scopeAllows(code, type, spaceId) {
+  if (!code.scope_type) return true
+  if (code.scope_type === 'room') return type === 'room' && spaceId === code.scope_id
+  if (type === 'channel') return spaceId === code.scope_id
+  const row = db.prepare('SELECT channel_id FROM rooms WHERE id = ?').get(spaceId)
+  return !!row && row.channel_id === code.scope_id
+}
+
+// What an admin reads: "General" for a channel, "General / Lobby" for a room.
+function scopeName(scope) {
+  if (!scope) return null
+  if (scope.type === 'channel') {
+    const ch = db.prepare('SELECT name FROM channels WHERE id = ?').get(scope.id)
+    return ch ? ch.name : null
+  }
+  const room = db
+    .prepare('SELECT rooms.name AS room, channels.name AS channel FROM rooms JOIN channels ON rooms.channel_id = channels.id WHERE rooms.id = ?')
+    .get(scope.id)
+  return room ? `${room.channel} / ${room.room}` : null
+}
+
+const scopeOf = (code) => (code.scope_type ? { type: code.scope_type, id: code.scope_id } : null)
+
+// The code row behind a guest, or an error answer (and null) if it can no longer
+// be used: revoked, or the channel or room it was for is gone.
+function guestCodeOrRefuse(res, guest) {
+  const code = db.prepare('SELECT * FROM join_codes WHERE id = ?').get(guest.codeId)
+  if (!code || code.revoked) {
+    res.status(403).json({ error: 'Your invite was revoked' })
+    return null
+  }
+  if (!scopeTargetExists(code)) {
+    res.status(403).json({ error: 'The room your invite was for no longer exists' })
+    return null
+  }
+  return code
+}
+
+// A channel or room was deleted: codes limited to it stop working and the guests
+// who came in with them are dropped (LiveKit first, then presence).
+async function revokeCodesScopedTo({ serverId, channelId = null, roomIds = [] }) {
+  const clauses = []
+  const params = [serverId]
+  if (channelId !== null) {
+    clauses.push("(scope_type = 'channel' AND scope_id = ?)")
+    params.push(channelId)
+  }
+  for (const rid of roomIds) {
+    clauses.push("(scope_type = 'room' AND scope_id = ?)")
+    params.push(rid)
+  }
+  if (clauses.length === 0) return
+  const ids = db
+    .prepare(`SELECT id FROM join_codes WHERE server_id = ? AND revoked = 0 AND (${clauses.join(' OR ')})`)
+    .all(...params)
+    .map((r) => r.id)
+  if (ids.length === 0) return
+  db.prepare(`UPDATE join_codes SET revoked = 1 WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids)
+  await disconnectGuests((g) => ids.includes(g.codeId))
 }
 
 app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) => {
@@ -1445,9 +1572,11 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
       return res.status(403).json({ error: "You weren't invited to that server" })
     }
     // The code they came in with must still be good: revoking it ends their access.
-    const code = db.prepare('SELECT revoked FROM join_codes WHERE id = ?').get(req.guest.codeId)
-    if (!code || code.revoked) {
-      return res.status(403).json({ error: 'Your invite was revoked' })
+    // And it may be for one channel or room only.
+    const code = guestCodeOrRefuse(res, req.guest)
+    if (!code) return
+    if (!scopeAllows(code, type, spaceId)) {
+      return res.status(403).json({ error: "Your invite doesn't cover that space" })
     }
     identity = req.guest.identity
     name = req.guest.screenName
@@ -1586,8 +1715,11 @@ app.post('/api/presence', presenceLimiter, requireAuthOrGuest, (req, res) => {
     if (req.guest.serverId !== serverId) {
       return res.status(403).json({ error: "You weren't invited to that server" })
     }
-    const code = db.prepare('SELECT revoked FROM join_codes WHERE id = ?').get(req.guest.codeId)
-    if (!code || code.revoked) return res.status(403).json({ error: 'Your invite was revoked' })
+    const code = guestCodeOrRefuse(res, req.guest)
+    if (!code) return
+    if (!scopeAllows(code, type, spaceId)) {
+      return res.status(403).json({ error: "Your invite doesn't cover that space" })
+    }
     // Being checked in to a space is being in its voice room, so remember it: ending
     // this session (revoked, expired) then knows which room to drop them from.
     ensureGuestSession(req.guest).rooms.add(`s${serverId}-${type}-${spaceId}`)

@@ -93,13 +93,25 @@ Codes look like `amber-fox-4821`: two words and a four digit number from a
 cryptographic random source, about 66 million combinations. Redeeming is rate
 limited per address (`JOIN_LIMIT`, 20 per 15 minutes by default).
 
-- `POST /api/servers/:id/codes` creates one (`singleUse`, `expiresInMinutes`).
+- `POST /api/servers/:id/codes` creates one (`singleUse`, `expiresInMinutes`, and
+  optionally `scope`, below).
 - `GET /api/servers/:id/codes` lists the ones still usable, with how many guests
   each has brought in who are still around.
 - `DELETE /api/servers/:id/codes/:codeId` **revokes** one: it admits nobody new,
   every guest who came in with it is refused a new voice token, and anyone
   already in a voice room is disconnected. This is how a guest is removed, since
   guests have no account to kick or ban.
+- **Scoped codes.** `scope: { type: "channel" | "room", id }` limits a code to one
+  channel (and its rooms) or one room, which must have voice and belong to that
+  server. A guest with one gets voice tokens and presence only for what it covers
+  (403 "Your invite doesn't cover that space" otherwise), and the tree they are
+  sent holds only that: for a room code, the parent channel with `joinable: false`
+  so they can see where the room lives, and just that room. Members never get a
+  filtered tree. A scoped code is for guests only: an account redeeming one under
+  `POST /api/servers/join` gets a 403 saying so, and the code is not used up. The
+  code list returns each code's `scope` with a `name`. Deleting the channel or room
+  revokes the codes for it and drops the guests who came in with them, like a
+  revoke. Codes made before scopes existed stay server-wide.
 - A single-use code is not used up by someone who is already a member.
 - A guest's access never outlasts the code: the guest token expires with it (or
   after 12 hours, whichever is sooner).
