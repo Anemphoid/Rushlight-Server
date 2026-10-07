@@ -131,6 +131,23 @@ const presenceLimiter = rateLimit({
 // identity -> { serverId, codeId, name, expiresAt, rooms: Set<string> }
 const guestSessions = new Map()
 
+// Guests an admin removed one by one (not by revoking their code). A guest token
+// is signed and would otherwise just rebuild its session on the next check-in, so
+// the identity is refused until the token would have expired anyway. In memory like
+// the sessions: a restart forgets it, and a reusable code can still be used to come
+// back in under a new identity, so revoke the code to keep someone out.
+// identity -> the token's expiry (ms)
+const removedGuests = new Map()
+function guestWasRemoved(identity) {
+  const until = removedGuests.get(identity)
+  if (until === undefined) return false
+  if (until <= Date.now()) {
+    removedGuests.delete(identity)
+    return false
+  }
+  return true
+}
+
 // A guest's session ends when their token does: at the join code's own expiry,
 // or after 12 hours, whichever comes first. Ending it also drops them from the
 // voice rooms they were handed tokens for, because LiveKit only checks a token
@@ -1156,7 +1173,6 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
     .prepare(
       `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at, scope_type, scope_id FROM join_codes
        WHERE server_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > ?)
-         AND NOT (single_use = 1 AND used = 1)
        ORDER BY id DESC`
     )
     .all(req.params.id, now)
@@ -1166,12 +1182,16 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
   }
   res.json({
     codes: rows
+      // A used single-use code can't admit anyone new, but stays listed while a guest
+      // who came in with it is still here, so there is something to revoke.
+      .filter((r) => !(r.single_use && r.used) || guestsByCode.has(r.id))
       .filter((r) => scopeTargetExists(r)) // a code for a deleted channel or room is dead
       .map((r) => ({
         id: r.id,
         code: r.code,
         persistent: !!r.persistent,
         singleUse: !!r.single_use,
+        used: !!r.used,
         expiresAt: r.expires_at,
         createdAt: r.created_at,
         guestsNow: guestsByCode.get(r.id) || 0,
@@ -1519,6 +1539,10 @@ const scopeOf = (code) => (code.scope_type ? { type: code.scope_type, id: code.s
 // The code row behind a guest, or an error answer (and null) if it can no longer
 // be used: revoked, or the channel or room it was for is gone.
 function guestCodeOrRefuse(res, guest) {
+  if (guestWasRemoved(guest.identity)) {
+    res.status(403).json({ error: 'You were removed from this server' })
+    return null
+  }
   const code = db.prepare('SELECT * FROM join_codes WHERE id = ?').get(guest.codeId)
   if (!code || code.revoked) {
     res.status(403).json({ error: 'Your invite was revoked' })
@@ -1772,6 +1796,18 @@ app.get('/api/servers/:id/guests', requireAuth, requireServerAdmin, (req, res) =
   guests.sort((a, b) => a.joinedAt - b.joinedAt)
   res.json({ guests })
 })
+
+// Remove one guest without revoking the code, so a reusable code's other guests
+// stay. Same order as revoke: LiveKit is told first, then presence is cleared.
+app.delete('/api/servers/:id/guests/:identity', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const serverId = Number(req.params.id)
+  const identity = req.params.identity
+  const g = liveGuests().get(identity)
+  if (!g || g.serverId !== serverId) return res.status(404).json({ error: 'That guest is no longer here' })
+  removedGuests.set(identity, g.expiresAt)
+  await endGuestSession(identity, g)
+  res.json({ removed: true })
+}))
 
 // --- Persistence vote routes ---
 
