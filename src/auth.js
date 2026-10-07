@@ -73,3 +73,6 @@ export function requireAuthOrGuest(req, res, next) {
   else req.account = payload
   next()
 }
+
+// THROWAWAY: deliberately broken to prove CI fails. Never merge.
+const = ;
