@@ -53,6 +53,10 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   `guestCodeOrRefuse` + `scopeAllows`, and the guest's tree comes from
   `serializeTree(serverId, scopeOf(code))`. Scoped codes never make an account a
   member. Deleting a channel/room must `await revokeCodesScopedTo(...)`.
+- Removing one guest (`DELETE .../guests/:identity`) adds the identity to `removedGuests`
+  and ends the session; `guestCodeOrRefuse` refuses it, because the signed token would
+  otherwise rebuild the session on the next check-in. The code list keeps a used
+  single-use code while a guest of it is live.
 - Presence, open votes and the guest-session map are in memory on purpose; a
   restart clears ephemeral history anyway.
 - Foreign key enforcement is off (as it has always been); deletes clean up their
