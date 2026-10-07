@@ -106,6 +106,24 @@ limited per address (`JOIN_LIMIT`, 20 per 15 minutes by default).
 - A guest can't use the name of any account (so a muted or banned member can't
   come straight back as a guest under their own name) or of another guest who is
   currently in the server.
+- **Guests are visible.** A guest checks in to presence like an account does
+  (`POST /api/presence`, and `POST /api/presence/leave`), so members see them in
+  the channel tree by screen name, with no avatar image. A guest can only check in
+  to a space in the server their code belongs to, and what they get back is limited
+  to the one space they are in, so they see the people they can already hear and
+  nothing about other rooms. A guest counts as an occupant, so an ephemeral room
+  does not wipe while one is in it. Guests have no account, so they cannot vote on
+  keeping history or write in chat. A guest who stops checking in drops out after
+  the presence timeout. Revoking their code or its expiry clears their presence
+  too, after LiveKit has been told to drop them.
+- `GET /api/servers/:id/guests` (admins only) lists the guests here now, for Admin
+  Tools: screen name, the code they came in with, when they joined, when their
+  session ends, and which space they are in. They are listed from the moment they
+  join. Like the sessions behind it, the list is in memory and starts empty after a
+  server restart, then refills as guests check in.
+- The check-in is rate limited per address (`PRESENCE_LIMIT`, 600 a minute by
+  default), generously, because several clients behind one address each check in
+  every 5 seconds. Accounts and guests share the limit.
 
 ## Ephemeral vs persistent
 
