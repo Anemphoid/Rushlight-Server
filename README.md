@@ -96,7 +96,9 @@ limited per address (`JOIN_LIMIT`, 20 per 15 minutes by default).
 - `POST /api/servers/:id/codes` creates one (`singleUse`, `expiresInMinutes`, and
   optionally `scope`, below).
 - `GET /api/servers/:id/codes` lists the ones still usable, with how many guests
-  each has brought in who are still around.
+  each has brought in who are still around. A single-use code that has been used
+  stays listed (`used: true`) for as long as a guest who came in with it is still
+  here, so there is something to revoke; it drops off when that guest's session ends.
 - `DELETE /api/servers/:id/codes/:codeId` **revokes** one: it admits nobody new,
   every guest who came in with it is refused a new voice token, and anyone
   already in a voice room is disconnected. This is how a guest is removed, since
@@ -112,6 +114,12 @@ limited per address (`JOIN_LIMIT`, 20 per 15 minutes by default).
   code list returns each code's `scope` with a `name`. Deleting the channel or room
   revokes the codes for it and drops the guests who came in with them, like a
   revoke. Codes made before scopes existed stay server-wide.
+- `DELETE /api/servers/:id/guests/:identity` (admins only) removes one guest without
+  revoking their code, so other guests of a reusable code stay. LiveKit is told first,
+  then presence is cleared. The guest's token is refused for the rest of its life
+  ("You were removed from this server"). That refusal is kept in memory, so a server
+  restart forgets it, and a guest holding a reusable code can come back in under a new
+  identity: revoke the code to keep someone out.
 - A single-use code is not used up by someone who is already a member.
 - A guest's access never outlasts the code: the guest token expires with it (or
   after 12 hours, whichever is sooner).
