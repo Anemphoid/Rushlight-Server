@@ -185,6 +185,19 @@ export const migrations = [
         CREATE INDEX IF NOT EXISTS idx_access_ends_ended_at ON access_ends(ended_at);
       `)
     }
+  },
+  {
+    id: 8,
+    name: 'join codes can be limited to one channel or room',
+    up(db) {
+      // Both columns are nullable: a code with no scope is a server-wide code, so
+      // every code made before this stays exactly as it was. scope_type is 'channel'
+      // or 'room'; scope_id is that channel's or room's id.
+      db.exec(`
+        ALTER TABLE join_codes ADD COLUMN scope_type TEXT;
+        ALTER TABLE join_codes ADD COLUMN scope_id INTEGER;
+      `)
+    }
   }
 ]
 

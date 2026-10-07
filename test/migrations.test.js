@@ -34,9 +34,9 @@ test('an existing database upgrades in place and keeps its data', async () => {
   oldDatabase(path)
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 3 migration/)
+    assert.match(srv.log(), /Applied 4 migration/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT revoked FROM join_codes').get().revoked, 0)
     assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_accounts_username_nocase'").get())
@@ -73,21 +73,46 @@ test('existing usernames that differ only by case do not stop the server from st
   }
 })
 
-test('an install already at migration 6 (the released v0.2.0) applies only the new one', async () => {
+test('an install already at migration 6 (the released v0.2.0) applies the newer ones', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'rushlight-mig-'))
   const path = join(dir, 'v020.db')
   oldDatabase(path, { upTo: 6 })
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 1 migration\(s\): remember why someone lost access/)
+    assert.match(srv.log(), /Applied 2 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM access_ends').get().n, 0)
     db.close()
     // the existing server and account are untouched
     const login = await srv.call('POST', '/api/register', { username: 'afterwards', password: 'password123' })
     assert.equal(login.status, 200)
+  } finally {
+    await srv.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an install at migration 7 (the released v0.3.0) gets scoped codes and its old codes keep working', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rushlight-mig-'))
+  const path = join(dir, 'v030.db')
+  oldDatabase(path, { upTo: 7 })
+  const seed = new Database(path)
+  seed.prepare("INSERT INTO join_codes (code, server_id, created_by, created_at) VALUES ('old-code-34', 1, 1, 1)").run()
+  seed.close()
+  const srv = await startServer({ dbPath: path })
+  try {
+    assert.match(srv.log(), /Applied 1 migration\(s\): join codes can be limited to one channel or room/)
+    const db = new Database(path, { readonly: true })
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8])
+    const row = db.prepare('SELECT scope_type, scope_id FROM join_codes').get()
+    assert.deepEqual(row, { scope_type: null, scope_id: null }) // old codes stay server-wide
+    db.close()
+    const r = await srv.call('POST', '/api/register', { username: 'afterwards', password: 'password123' })
+    assert.equal((await srv.call('POST', '/api/servers/join', { code: 'old-code-12' }, r.data.token)).status, 200)
+    const guest = await srv.call('POST', '/api/join', { code: 'old-code-34', screenName: 'Old Code Guest' })
+    assert.equal(guest.status, 200)
   } finally {
     await srv.stop()
     rmSync(dir, { recursive: true, force: true })
