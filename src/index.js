@@ -110,6 +110,17 @@ const joinLimiter = rateLimit({
   message: { error: 'Too many join attempts. Try again in a few minutes.' }
 })
 
+// The 5 second check-in is the busiest route there is. A household behind one
+// address can have several clients checking in, so the limit is generous: it is
+// there to stop a flood, not to shape normal use. Per IP, counting every attempt.
+const presenceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.PRESENCE_LIMIT) || 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many check-ins from this address. Slow down a little.' }
+})
+
 // --- Guests ---------------------------------------------------------------
 // Guests have no account, so they can't be muted or banned by account. What an
 // admin can do instead is revoke the join code they came in with. This map
@@ -124,15 +135,35 @@ const guestSessions = new Map()
 // or after 12 hours, whichever comes first. Ending it also drops them from the
 // voice rooms they were handed tokens for, because LiveKit only checks a token
 // when someone connects and would otherwise leave them in the call.
-function endGuestSession(identity, g) {
+// LiveKit is told first and presence is cleared after, the same order kick uses.
+async function endGuestSession(identity, g) {
   guestSessions.delete(identity)
-  for (const room of g.rooms) bestEffort(roomService.removeParticipant(room, identity))
+  await Promise.all([...g.rooms].map((room) => bestEffort(roomService.removeParticipant(room, identity))))
+  removePresence(identity)
+}
+
+// The session for a guest token, made again if the server has forgotten it (a
+// restart clears the map). The token carries everything needed to rebuild it.
+function ensureGuestSession(claims) {
+  let session = liveGuests().get(claims.identity)
+  if (!session) {
+    session = {
+      serverId: claims.serverId,
+      codeId: claims.codeId,
+      name: claims.screenName,
+      joinedAt: claims.iat * 1000,
+      expiresAt: claims.exp * 1000,
+      rooms: new Set()
+    }
+    guestSessions.set(claims.identity, session)
+  }
+  return session
 }
 
 function liveGuests() {
   const now = Date.now()
   for (const [identity, g] of guestSessions) {
-    if (g.expiresAt <= now) endGuestSession(identity, g)
+    if (g.expiresAt <= now) endGuestSession(identity, g).catch(() => {})
   }
   return guestSessions
 }
@@ -154,9 +185,7 @@ function bestEffort(promise) {
 async function disconnectGuests(match) {
   const jobs = []
   for (const [identity, g] of liveGuests()) {
-    if (!match(g)) continue
-    for (const room of g.rooms) jobs.push(bestEffort(roomService.removeParticipant(room, identity)))
-    guestSessions.delete(identity)
+    if (match(g)) jobs.push(endGuestSession(identity, g))
   }
   await Promise.all(jobs)
 }
@@ -328,17 +357,21 @@ function refuseIfOthersHaveWritten(res, type, id, what) {
   return true
 }
 
-function presenceForServer(serverId) {
+// onlyKey limits the answer to one space ('channel:3'), which is all a guest sees.
+// Guests are listed by screen name with no avatar image; their ids are strings
+// (the guest identity), so the avatar lookup below only asks about account ids.
+function presenceForServer(serverId, onlyKey = null) {
   const now = Date.now()
   const out = {}
   const included = []
   const allIds = new Set()
   for (const [key, space] of presence) {
     if (space.serverId !== serverId) continue
+    if (onlyKey && key !== onlyKey) continue
     pruneEntries(space, now)
     if (space.entries.size === 0) continue
     included.push([key, space])
-    for (const id of space.entries.keys()) allIds.add(id)
+    for (const id of space.entries.keys()) if (typeof id === 'number') allIds.add(id)
   }
   // One batched lookup rather than one query per person present, so a
   // presence poll on a busy server stays a single extra query, not N.
@@ -353,19 +386,21 @@ function presenceForServer(serverId) {
       id,
       name: e.name,
       avatarColor: e.avatarColor,
-      avatarUpdatedAt: avatarUpdatedAt.get(id) || null
+      avatarUpdatedAt: avatarUpdatedAt.get(id) || null,
+      ...(e.guest ? { guest: true } : {})
     }))
   }
   return out
 }
 
-function recordPresence({ type, id, serverId, account, avatarColor }) {
+// who: the account id for an account, or the guest identity string for a guest.
+function recordPresence({ type, id, serverId, who, name, avatarColor, guest = false }) {
   const now = Date.now()
   const key = spaceKey(type, id)
   // You can only be in one space per server: checking in here means leaving
   // wherever you were before, which starts that space's wipe clock.
   for (const [otherKey, space] of presence) {
-    if (otherKey !== key && space.serverId === serverId && space.entries.delete(account.sub)) {
+    if (otherKey !== key && space.serverId === serverId && space.entries.delete(who)) {
       if (space.entries.size === 0) space.emptySince = now
     }
   }
@@ -374,10 +409,11 @@ function recordPresence({ type, id, serverId, account, avatarColor }) {
     space = { serverId, entries: new Map(), emptySince: null }
     presence.set(key, space)
   }
-  space.entries.set(account.sub, {
-    name: account.username,
+  space.entries.set(who, {
+    name,
     avatarColor: cleanColor(avatarColor),
-    lastSeen: now
+    lastSeen: now,
+    guest
   })
   space.emptySince = null
 }
@@ -1351,6 +1387,7 @@ app.post('/api/join', joinLimiter, (req, res) => {
     serverId: server.id,
     codeId: record.id,
     name: screenName,
+    joinedAt: Date.now(),
     expiresAt: Date.now() + lifetimeMs,
     rooms: new Set()
   })
@@ -1368,7 +1405,7 @@ app.post('/api/join', joinLimiter, (req, res) => {
       name: server.name,
       isAdmin: false,
       channels: serializeTree(server.id),
-      presence: presenceForServer(server.id)
+      presence: {} // a guest sees who is in their own space once they are in one
     }
   })
 })
@@ -1427,18 +1464,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
   if (req.guest) {
     // Remember the room, so revoking the invite can pull them out of it. After a
     // restart this is rebuilt as guests ask for tokens again.
-    let session = liveGuests().get(identity)
-    if (!session) {
-      session = {
-        serverId: req.guest.serverId,
-        codeId: req.guest.codeId,
-        name,
-        expiresAt: req.guest.exp * 1000,
-        rooms: new Set()
-      }
-      guestSessions.set(identity, session)
-    }
-    session.rooms.add(room)
+    ensureGuestSession(req.guest).rooms.add(room)
   }
   res.json({ token, livekitUrl: LIVEKIT_URL, room })
 }))
@@ -1543,7 +1569,11 @@ app.post('/api/rooms/:roomId/messages', requireAuth, requireSpaceMember('room', 
 
 // Check in to a channel or room. Returns everyone currently in this server's
 // spaces, so the caller sees who's around without a second request.
-app.post('/api/presence', requireAuth, (req, res) => {
+//
+// Guests check in too, so members can see them and match them to the voice they
+// hear. A guest can only check in to a space in the server their code belongs to,
+// and what they get back is limited to the one space they are in.
+app.post('/api/presence', presenceLimiter, requireAuthOrGuest, (req, res) => {
   const { type, id, avatarColor } = req.body || {}
   const spaceId = Number(id)
   if ((type !== 'channel' && type !== 'room') || !Number.isInteger(spaceId)) {
@@ -1551,14 +1581,64 @@ app.post('/api/presence', requireAuth, (req, res) => {
   }
   const serverId = serverIdForSpace(type, spaceId)
   if (!serverId) return res.status(404).json({ error: 'Not found' })
+
+  if (req.guest) {
+    if (req.guest.serverId !== serverId) {
+      return res.status(403).json({ error: "You weren't invited to that server" })
+    }
+    const code = db.prepare('SELECT revoked FROM join_codes WHERE id = ?').get(req.guest.codeId)
+    if (!code || code.revoked) return res.status(403).json({ error: 'Your invite was revoked' })
+    // Being checked in to a space is being in its voice room, so remember it: ending
+    // this session (revoked, expired) then knows which room to drop them from.
+    ensureGuestSession(req.guest).rooms.add(`s${serverId}-${type}-${spaceId}`)
+    recordPresence({
+      type,
+      id: spaceId,
+      serverId,
+      who: req.guest.identity,
+      name: req.guest.screenName,
+      avatarColor,
+      guest: true
+    })
+    return res.json({ presence: presenceForServer(serverId, spaceKey(type, spaceId)) })
+  }
+
   if (!getMembership(serverId, req.account.sub)) return notAMember(res, serverId, req.account.sub)
-  recordPresence({ type, id: spaceId, serverId, account: req.account, avatarColor })
+  recordPresence({ type, id: spaceId, serverId, who: req.account.sub, name: req.account.username, avatarColor })
   res.json({ presence: presenceForServer(serverId) })
 })
 
-app.post('/api/presence/leave', requireAuth, (req, res) => {
-  removePresence(req.account.sub)
+app.post('/api/presence/leave', requireAuthOrGuest, (req, res) => {
+  removePresence(req.guest ? req.guest.identity : req.account.sub)
   res.json({ left: true })
+})
+
+// Who is here as a guest right now, for Admin Tools. Guests have no account, so
+// they are not in the members list; this is the other half. Revoking the code a
+// guest came in with is how they are removed.
+app.get('/api/servers/:id/guests', requireAuth, requireServerAdmin, (req, res) => {
+  const serverId = Number(req.params.id)
+  const here = new Map() // identity -> 'channel:3' for guests currently checked in
+  for (const [key, space] of presence) {
+    if (space.serverId !== serverId) continue
+    for (const [who, entry] of space.entries) if (entry.guest) here.set(who, key)
+  }
+  const guests = []
+  for (const [identity, g] of liveGuests()) {
+    if (g.serverId !== serverId) continue
+    const code = db.prepare('SELECT code FROM join_codes WHERE id = ?').get(g.codeId)
+    guests.push({
+      identity,
+      name: g.name,
+      code: code ? code.code : null,
+      codeId: g.codeId,
+      joinedAt: g.joinedAt,
+      expiresAt: g.expiresAt,
+      space: here.get(identity) || null
+    })
+  }
+  guests.sort((a, b) => a.joinedAt - b.joinedAt)
+  res.json({ guests })
 })
 
 // --- Persistence vote routes ---

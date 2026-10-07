@@ -42,6 +42,9 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
 - Kick, ban and expiry all go through `removeMember`, which deletes the
   membership, records why in `access_ends` (so the 403 can say `reason`), asks
   LiveKit to disconnect first and only then clears presence. Keep that order.
+- Guests check in to presence (keyed by their identity string, flagged `guest`) and
+  are visible to members; a guest only ever gets back the one space they are in.
+  Anything keyed by account id must tolerate guest ids (strings) in presence.
 - A guest session ending (code expiry or the 12 hour cap) also drops the guest from
   their voice rooms; `endGuestSession` does it, and the sweep calls `liveGuests()`
   so it happens without anyone making a request.
