@@ -528,6 +528,24 @@ function requireServerAdmin(req, res, next) {
   next()
 }
 
+// The owner is the account in servers.owner_id. Today that is whoever created the server;
+// ownership can be handed on with POST /api/servers/:id/transfer. Owner-only: transferring,
+// and deleting the server. Everything else an owner does, an admin can too.
+function ownerIdOf(serverId) {
+  const row = db.prepare('SELECT owner_id FROM servers WHERE id = ?').get(serverId)
+  return row ? row.owner_id : null
+}
+
+function requireServerOwner(req, res, next) {
+  const membership = getMembership(req.params.id, req.account.sub)
+  if (!membership) return notAMember(res, req.params.id, req.account.sub)
+  if (ownerIdOf(req.params.id) !== req.account.sub) {
+    return res.status(403).json({ error: 'Only the server owner can do that' })
+  }
+  req.membership = membership
+  next()
+}
+
 function isBanned(serverId, accountId) {
   return !!db.prepare('SELECT 1 FROM server_bans WHERE server_id = ? AND account_id = ?').get(serverId, accountId)
 }
@@ -976,14 +994,15 @@ app.post('/api/servers', requireAuth, (req, res) => {
 app.get('/api/servers', requireAuth, (req, res) => {
   const servers = db
     .prepare(
-      `SELECT servers.id, servers.name, server_members.is_admin as isAdmin
+      `SELECT servers.id, servers.name, server_members.is_admin as isAdmin,
+         (servers.owner_id = server_members.account_id) as isOwner
        FROM servers
        JOIN server_members ON server_members.server_id = servers.id
        WHERE server_members.account_id = ?
        ORDER BY server_members.joined_at`
     )
     .all(req.account.sub)
-  res.json({ servers: servers.map((s) => ({ ...s, isAdmin: !!s.isAdmin })) })
+  res.json({ servers: servers.map((s) => ({ ...s, isAdmin: !!s.isAdmin, isOwner: !!s.isOwner })) })
 })
 
 app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
@@ -993,6 +1012,7 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
     id: server.id,
     name: server.name,
     isAdmin: !!req.membership.is_admin,
+    isOwner: server.owner_id === req.account.sub,
     channels: serializeTree(server.id),
     presence: presenceForServer(server.id),
     proposals: proposalsForServer(server.id, req.account.sub)
@@ -1006,7 +1026,19 @@ app.patch('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
   res.json({ updated: true })
 })
 
-app.delete('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
+// Deleting a server is the owner's alone, and needs their password, so a stolen session
+// can't wipe a server. It removes every channel, room, message, code and membership.
+app.delete('/api/servers/:id', accountSecretsLimiter, requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  const { password } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const me = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!me || !(await verifyPassword(password, me.password_hash))) {
+    return res.status(401).json({ error: 'Incorrect password' })
+  }
+  // checking the password took a moment: make sure they still own it
+  if (ownerIdOf(req.params.id) !== req.account.sub) {
+    return res.status(403).json({ error: 'Only the server owner can do that' })
+  }
   const id = req.params.id
   const roomIds = db
     .prepare(
@@ -1039,7 +1071,41 @@ app.delete('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
   tx()
   forgetServer(Number(id), voiceRooms)
   res.json({ deleted: true })
-})
+}))
+
+// Hand the server to another member. Immediate and final: the old owner stays an admin,
+// the new owner is made one (and loses any timer or mute, since an owner must never expire
+// or be silenced by an admin). Only the owner can start it, and it needs their password.
+app.post('/api/servers/:id/transfer', accountSecretsLimiter, requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  const { accountId, password } = req.body || {}
+  const targetId = Number(accountId)
+  if (!Number.isInteger(targetId) || targetId <= 0) return res.status(400).json({ error: 'Pick a member to hand the server to' })
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  if (targetId === req.account.sub) return res.status(400).json({ error: 'You already own this server' })
+  const serverId = Number(req.params.id)
+  if (!getMembership(serverId, targetId)) return res.status(404).json({ error: 'That person is not a member of this server' })
+
+  const me = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!me || !(await verifyPassword(password, me.password_hash))) {
+    return res.status(401).json({ error: 'Incorrect password' })
+  }
+
+  // The password check took a moment. Re-check everything in one synchronous step, so
+  // the change only happens if you still own it and they are still a member.
+  const done = db.transaction(() => {
+    if (ownerIdOf(serverId) !== req.account.sub) return 'not-owner'
+    if (!getMembership(serverId, targetId)) return 'not-member'
+    db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(targetId, serverId)
+    db.prepare(
+      'UPDATE server_members SET is_admin = 1, muted = 0, access_expires_at = NULL WHERE server_id = ? AND account_id = ?'
+    ).run(serverId, targetId)
+    db.prepare('UPDATE server_members SET is_admin = 1 WHERE server_id = ? AND account_id = ?').run(serverId, req.account.sub)
+    return 'ok'
+  })()
+  if (done === 'not-owner') return res.status(403).json({ error: 'Only the server owner can do that' })
+  if (done === 'not-member') return res.status(404).json({ error: 'That person is not a member of this server' })
+  res.json({ transferred: true, ownerId: targetId })
+}))
 
 // --- Channels ---
 
@@ -1347,6 +1413,7 @@ function serializeMember(row) {
     accountId: row.account_id,
     username: row.username,
     isAdmin: !!row.is_admin,
+    isOwner: !!row.is_owner,
     muted: !!row.muted,
     accessExpiresAt: row.access_expires_at,
     joinedAt: row.joined_at,
@@ -1357,8 +1424,10 @@ function serializeMember(row) {
 app.get('/api/servers/:id/members', requireAuth, requireServerMember, (req, res) => {
   const rows = db
     .prepare(
-      `SELECT server_members.*, accounts.username, accounts.avatar_updated_at FROM server_members
+      `SELECT server_members.*, accounts.username, accounts.avatar_updated_at,
+         (servers.owner_id = server_members.account_id) as is_owner FROM server_members
        JOIN accounts ON accounts.id = server_members.account_id
+       JOIN servers ON servers.id = server_members.server_id
        WHERE server_members.server_id = ? ORDER BY server_members.joined_at`
     )
     .all(req.params.id)
