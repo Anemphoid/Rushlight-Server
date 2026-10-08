@@ -196,6 +196,27 @@ and 10 registrations per hour (`LOGIN_LIMIT`, `REGISTER_LIMIT`). Every attempt
 counts, successful or not, so there is no per-account counter that someone could
 abuse to lock a real person out.
 
+### Owners: handing a server on, and deleting it
+
+Each server has one **owner** (`servers.owner_id`, the creator to start with) and any
+number of admins. An owner can do everything an admin can, plus two things only the
+owner can do, both needing their **password** (checked again after the slow hash, so a
+stolen session or a race can't slip through) and rate limited like the other password
+routes (`ACCOUNT_LIMIT`):
+
+- `POST /api/servers/:id/transfer` with `accountId` and `password` hands the server to
+  any current member. It is immediate: the old owner stays an admin, the new owner is
+  made one, and loses any mute or access timer, because an owner never expires. Not
+  yourself, not a non-member (a banned person is not one), not if you are no longer the
+  owner by the time the password check finishes. The new owner is then protected from
+  kick, ban and mute like any owner.
+- `DELETE /api/servers/:id` with `password` deletes the server and everything in it.
+  **This used to be allowed for any admin without a password**; it is now the owner's
+  alone. A client from before this release has no delete button, so nothing breaks.
+
+`GET /api/servers`, `GET /api/servers/:id` and the members list carry `isOwner`. No
+migration.
+
 ### Recovery keys, password change and reset
 
 There is no admin reset anywhere: a server admin has no account-level access, and the

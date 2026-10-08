@@ -57,6 +57,10 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   and ends the session; `guestCodeOrRefuse` refuses it, because the signed token would
   otherwise rebuild the session on the next check-in. The code list keeps a used
   single-use code while a guest of it is live.
+- Owner-only actions (`requireServerOwner`: transfer and delete server) need the owner's
+  password, which is re-verified after the async hash and the ownership re-checked in a
+  synchronous step. Admins who are not the owner are refused. Don't make anything else
+  owner-only without saying so.
 - Account recovery keys (`src/recoverykey.js`, word list `src/recoverywords.js`): only a
   SHA-256 is stored, a new key is pending until `/api/me/recovery-key/ack`, and a
   password change or reset raises `accounts.session_epoch`, which `auth.js` checks on

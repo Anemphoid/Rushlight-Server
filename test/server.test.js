@@ -266,7 +266,7 @@ test('deleting a server removes its bans, codes and members', async () => {
   const carol = await newAccount(srv)
   await srv.call('POST', '/api/servers/join', { code: w.code.code }, carol.token)
   await srv.call('POST', `/api/servers/${w.s.id}/members/${carol.id}/ban`, {}, w.owner.token)
-  assert.equal((await srv.call('DELETE', `/api/servers/${w.s.id}`, undefined, w.owner.token)).status, 200)
+  assert.equal((await srv.call('DELETE', `/api/servers/${w.s.id}`, { password: 'password123' }, w.owner.token)).status, 200)
   const db = new Database(srv.dbPath, { readonly: true })
   const left = (table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE server_id = ?`).get(w.s.id).n
   assert.equal(left('server_bans'), 0)
