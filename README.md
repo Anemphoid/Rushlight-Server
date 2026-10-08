@@ -196,6 +196,40 @@ and 10 registrations per hour (`LOGIN_LIMIT`, `REGISTER_LIMIT`). Every attempt
 counts, successful or not, so there is no per-account counter that someone could
 abuse to lock a real person out.
 
+### Recovery keys, password change and reset
+
+There is no admin reset anywhere: a server admin has no account-level access, and the
+only way back into an account after a forgotten password is its **recovery key**. A
+test fails if any route touching a password or key is added beyond the four below.
+
+- **A key** is 12 words from a 2048 word list (about 132 bits). `POST /api/register`
+  returns it once, as `recoveryKey`. Only a SHA-256 of it is stored (a key this strong
+  gains nothing from a slow hash, and bcrypt would cut it at 72 bytes), so it can never
+  be shown again. It counts only once the client confirms the person saved it with
+  `POST /api/me/recovery-key/ack`; until then it is *pending* and a working key, if any,
+  is not replaced. `login` and `GET /api/me` return `recoveryKeyAcked`, false for every
+  account made before keys existed and for sign-ups closed before the key was saved.
+  Those accounts log in normally and the client asks them to make a key.
+- `POST /api/me/recovery-key` (own account, current password required) makes a new
+  pending key. It is only a replacement once confirmed with the ack route, so an
+  abandoned one leaves the old key working.
+- `POST /api/me/password` (current password required) changes the password.
+- `POST /api/recover` takes `username`, `key` and `newPassword`. Typing is forgiving
+  (case, spaces, dashes). A wrong key, an unknown username, a malformed key and an
+  account with no confirmed key all get the same 401, so it doesn't reveal which
+  usernames exist. A good key is spent: it returns the next key (pending, to be
+  confirmed like any other) along with a fresh login token.
+- **Sessions end on a password change or reset.** Login tokens carry a `session_epoch`
+  (migration 9), and every authenticated request checks it, so changing or resetting a
+  password signs out every other session of that account. It is one small lookup per
+  request. Tokens issued before this carry no epoch, which counts as 0, so nobody is
+  signed out by the update itself.
+- Rate limits, per address, counting every attempt: reset 5 per 15 minutes
+  (`RECOVER_LIMIT`), and change-password and make-a-key 10 per 15 minutes
+  (`ACCOUNT_LIMIT`).
+- If someone loses both their password and their key the account cannot be recovered.
+  That is deliberate.
+
 With no reverse proxy in front (the default), leave `TRUST_PROXY` unset. Behind one
 (for example Caddy), set `TRUST_PROXY=1` so the real client's address is read from
 `X-Forwarded-For`. Only set it with a real proxy actually in front; without one a

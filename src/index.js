@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto'
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { db } from './db.js'
 import { generateCode } from './wordlist.js'
+import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches } from './recoverykey.js'
 import {
   hashPassword,
   verifyPassword,
@@ -97,6 +98,24 @@ const registerLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many accounts created from this address. Try again later.' }
+})
+
+// Resetting a password with a recovery key, and the routes that need the current
+// password (change it, make a new key), are the other places a password or key can be
+// guessed, so each has its own tight limit. Per IP, counting every attempt.
+const recoverLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.RECOVER_LIMIT) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many reset attempts. Try again in a few minutes.' }
+})
+const accountSecretsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.ACCOUNT_LIMIT) || 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Try again in a few minutes.' }
 })
 
 // Join codes are the only thing standing between a stranger and a server, and
@@ -682,6 +701,36 @@ function cleanUsername(value) {
   return name && name.length >= 3 ? name : null
 }
 
+// The rules for a new password, shared by sign-up, change and reset. bcrypt only reads
+// the first 72 bytes, so a longer password would silently be a shorter one; say so.
+function passwordProblem(password) {
+  if (typeof password !== 'string' || password.length < 8) return 'Password needs 8+ characters'
+  if (Buffer.byteLength(password) > 72) return 'Password can be at most 72 bytes long'
+  return null
+}
+
+// What a client is told about an account after it signs in or up.
+function sessionResponse(account, extra = {}) {
+  return {
+    token: signSession(account),
+    id: account.id,
+    username: account.username,
+    isAdmin: !!account.is_admin,
+    avatarUpdatedAt: account.avatar_updated_at || null,
+    // false until the person has confirmed they saved a recovery key
+    recoveryKeyAcked: !!account.recovery_key_hash,
+    ...extra
+  }
+}
+
+// Makes a new key for an account and keeps its hash as pending, to be confirmed with
+// POST /api/me/recovery-key/ack. Returns the key itself, the only time it exists.
+function issuePendingKey(accountId) {
+  const key = generateRecoveryKey()
+  db.prepare('UPDATE accounts SET pending_recovery_key_hash = ? WHERE id = ?').run(hashRecoveryKey(key), accountId)
+  return key
+}
+
 app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
   const body = req.body || {}
   const username = cleanUsername(body.username)
@@ -689,14 +738,8 @@ app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
   if (!username) {
     return res.status(400).json({ error: 'Username needs 3 to 32 printable characters' })
   }
-  if (typeof password !== 'string' || password.length < 8) {
-    return res.status(400).json({ error: 'Password needs 8+ characters' })
-  }
-  // bcrypt only reads the first 72 bytes, so a longer password would silently
-  // be a shorter one. Say so instead.
-  if (Buffer.byteLength(password) > 72) {
-    return res.status(400).json({ error: 'Password can be at most 72 bytes long' })
-  }
+  const problem = passwordProblem(password)
+  if (problem) return res.status(400).json({ error: problem })
 
   const hash = await hashPassword(password)
 
@@ -714,14 +757,9 @@ app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
     .run(username, hash, isFirstAccount ? 1 : 0, Date.now())
 
   const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(info.lastInsertRowid)
-  const token = signSession(account)
-  res.json({
-    token,
-    id: account.id,
-    username: account.username,
-    isAdmin: !!account.is_admin,
-    avatarUpdatedAt: account.avatar_updated_at || null
-  })
+  // The recovery key is made now and shown once, with the account. It counts once the
+  // person confirms they saved it.
+  res.json(sessionResponse(account, { recoveryKey: issuePendingKey(account.id) }))
 }))
 
 app.post('/api/login', loginLimiter, asyncHandler(async (req, res) => {
@@ -742,25 +780,102 @@ app.post('/api/login', loginLimiter, asyncHandler(async (req, res) => {
   if (!ok) {
     return res.status(401).json({ error: 'Incorrect username or password' })
   }
-  const token = signSession(account)
-  res.json({
-    token,
-    id: account.id,
-    username: account.username,
-    isAdmin: !!account.is_admin,
-    avatarUpdatedAt: account.avatar_updated_at || null
-  })
+  res.json(sessionResponse(account))
 }))
 
 app.get('/api/me', requireAuth, (req, res) => {
-  const account = db.prepare('SELECT avatar_updated_at FROM accounts WHERE id = ?').get(req.account.sub)
+  const account = db.prepare('SELECT avatar_updated_at, recovery_key_hash FROM accounts WHERE id = ?').get(req.account.sub)
   res.json({
     id: req.account.sub,
     username: req.account.username,
     isAdmin: req.account.isAdmin,
-    avatarUpdatedAt: (account && account.avatar_updated_at) || null
+    avatarUpdatedAt: (account && account.avatar_updated_at) || null,
+    recoveryKeyAcked: !!(account && account.recovery_key_hash)
   })
 })
+
+// --- Recovery key, password change and reset ---
+// Everything here acts on the caller's own account and nobody else's: there is no route
+// that lets a server admin, or anyone, reset another account's password or read its key.
+
+// A new key, for an account with none yet or one that wants a fresh one. Needs the
+// current password, so a stolen session can't mint itself a way to take the account.
+// The key is pending until confirmed; a working key is not replaced until then.
+app.post('/api/me/recovery-key', accountSecretsLimiter, requireAuth, asyncHandler(async (req, res) => {
+  const { password } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!account || !(await verifyPassword(password, account.password_hash))) {
+    return res.status(401).json({ error: 'Incorrect password' })
+  }
+  res.json({ recoveryKey: issuePendingKey(account.id) })
+}))
+
+// The person confirmed they saved the key they were just shown: it becomes the working
+// key and the old one, if any, stops working.
+app.post('/api/me/recovery-key/ack', requireAuth, (req, res) => {
+  const account = db.prepare('SELECT pending_recovery_key_hash FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!account || !account.pending_recovery_key_hash) {
+    return res.status(409).json({ error: 'There is no new recovery key waiting to be confirmed' })
+  }
+  db.prepare(
+    `UPDATE accounts SET recovery_key_hash = pending_recovery_key_hash, pending_recovery_key_hash = NULL,
+       recovery_key_set_at = ? WHERE id = ?`
+  ).run(Date.now(), req.account.sub)
+  res.json({ recoveryKeyAcked: true })
+})
+
+// Change the password while signed in. Every other session of the account ends; this
+// one carries on with the fresh token in the answer.
+app.post('/api/me/password', accountSecretsLimiter, requireAuth, asyncHandler(async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {}
+  if (typeof currentPassword !== 'string' || !currentPassword) {
+    return res.status(400).json({ error: 'Your current password is required' })
+  }
+  const problem = passwordProblem(newPassword)
+  if (problem) return res.status(400).json({ error: problem })
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!account || !(await verifyPassword(currentPassword, account.password_hash))) {
+    return res.status(401).json({ error: 'Incorrect current password' })
+  }
+  const hash = await hashPassword(newPassword)
+  db.prepare('UPDATE accounts SET password_hash = ?, session_epoch = session_epoch + 1 WHERE id = ?').run(hash, account.id)
+  res.json(sessionResponse(db.prepare('SELECT * FROM accounts WHERE id = ?').get(account.id)))
+}))
+
+// Forgot the password: username, recovery key and a new password. Every failure looks
+// the same, so this does not say which usernames exist or whether they have a key. The
+// key is spent by use: a new one comes back, to be confirmed like any other, and every
+// older session ends.
+app.post('/api/recover', recoverLimiter, asyncHandler(async (req, res) => {
+  const { username, key, newPassword } = req.body || {}
+  const problem = passwordProblem(newPassword)
+  if (typeof username !== 'string' || typeof key !== 'string' || !username.trim() || !key.trim()) {
+    return res.status(400).json({ error: 'Username, recovery key and a new password are required' })
+  }
+  if (problem) return res.status(400).json({ error: problem })
+  const name = username.trim()
+  const account =
+    db.prepare('SELECT * FROM accounts WHERE username = ?').get(name) ||
+    db.prepare('SELECT * FROM accounts WHERE username = ? COLLATE NOCASE').get(name)
+  if (!account || !recoveryKeyMatches(key, account.recovery_key_hash)) {
+    return res.status(401).json({ error: "That username and recovery key don't match" })
+  }
+  const hash = await hashPassword(newPassword)
+  // Spend the key and end the old sessions in one statement, then issue the next key.
+  const spent = db
+    .prepare(
+      `UPDATE accounts SET password_hash = ?, recovery_key_hash = NULL, session_epoch = session_epoch + 1
+       WHERE id = ? AND recovery_key_hash = ?`
+    )
+    .run(hash, account.id, account.recovery_key_hash)
+  if (spent.changes !== 1) {
+    // someone used this same key a moment ago
+    return res.status(401).json({ error: "That username and recovery key don't match" })
+  }
+  const fresh = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account.id)
+  res.json(sessionResponse(fresh, { recoveryKey: issuePendingKey(account.id) }))
+}))
 
 // --- Avatars ---
 // A custom image lives on the account, not on every message or presence

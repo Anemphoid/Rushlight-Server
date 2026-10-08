@@ -198,6 +198,25 @@ export const migrations = [
         ALTER TABLE join_codes ADD COLUMN scope_id INTEGER;
       `)
     }
+  },
+  {
+    id: 9,
+    name: 'account recovery keys and sign-out-everywhere',
+    up(db) {
+      // recovery_key_hash is the key that works now (SHA-256 of the 12 words); it stays
+      // null until the person has confirmed they saved one, so every account made before
+      // this starts without one and nobody is locked out. pending_recovery_key_hash holds a
+      // key that has been shown but not yet confirmed, and takes over when it is. A key
+      // that was shown and then abandoned never replaces a working one.
+      // session_epoch is stamped into login tokens; changing or resetting a password
+      // raises it, which ends every older session.
+      db.exec(`
+        ALTER TABLE accounts ADD COLUMN recovery_key_hash TEXT;
+        ALTER TABLE accounts ADD COLUMN pending_recovery_key_hash TEXT;
+        ALTER TABLE accounts ADD COLUMN recovery_key_set_at INTEGER;
+        ALTER TABLE accounts ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0;
+      `)
+    }
   }
 ]
 

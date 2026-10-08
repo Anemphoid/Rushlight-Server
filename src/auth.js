@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+import { db } from './db.js'
 
 const JWT_SECRET = process.env.JWT_SECRET
 if (!JWT_SECRET) {
@@ -27,7 +28,12 @@ export function verifyAgainstNobody(password) {
 
 export function signSession(account) {
   return jwt.sign(
-    { sub: account.id, username: account.username, isAdmin: !!account.is_admin },
+    {
+      sub: account.id,
+      username: account.username,
+      isAdmin: !!account.is_admin,
+      ep: account.session_epoch || 0 // see session_epoch in migration 9
+    },
     JWT_SECRET,
     { expiresIn: '30d' }
   )
@@ -44,15 +50,29 @@ export function signGuest({ serverId, screenName, identity, codeId, expiresInSec
   })
 }
 
+const sessionEpoch = db.prepare('SELECT session_epoch FROM accounts WHERE id = ?')
+
 function readPayload(req) {
   const header = req.headers.authorization || ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : null
   if (!token) return { error: 'Missing session token' }
+  let payload
   try {
-    return { payload: jwt.verify(token, JWT_SECRET) }
+    payload = jwt.verify(token, JWT_SECRET)
   } catch {
     return { error: 'Invalid or expired session' }
   }
+  if (!payload.guest) {
+    // A token is only good while its account exists and its password has not been changed
+    // or reset since it was issued. Tokens from before sessions could end carry no epoch,
+    // which counts as 0, the value every account started with.
+    const row = sessionEpoch.get(payload.sub)
+    if (!row) return { error: 'Invalid or expired session' }
+    if ((payload.ep || 0) !== row.session_epoch) {
+      return { error: 'Your password was changed, so this session ended. Please log in again.' }
+    }
+  }
+  return { payload }
 }
 
 // Accounts only — a guest token is rejected here, so nothing that needs a

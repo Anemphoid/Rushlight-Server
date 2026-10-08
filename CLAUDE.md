@@ -57,6 +57,12 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   and ends the session; `guestCodeOrRefuse` refuses it, because the signed token would
   otherwise rebuild the session on the next check-in. The code list keeps a used
   single-use code while a guest of it is live.
+- Account recovery keys (`src/recoverykey.js`, word list `src/recoverywords.js`): only a
+  SHA-256 is stored, a new key is pending until `/api/me/recovery-key/ack`, and a
+  password change or reset raises `accounts.session_epoch`, which `auth.js` checks on
+  every account request. Never add a route that resets or reveals another account's
+  password or key (a test scans the source for that), and never change the word list
+  (it invalidates every issued key).
 - Presence, open votes and the guest-session map are in memory on purpose; a
   restart clears ephemeral history anyway.
 - Foreign key enforcement is off (as it has always been); deletes clean up their

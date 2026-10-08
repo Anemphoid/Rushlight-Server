@@ -6,7 +6,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test --test-concurrency=1 test/server.test.js test/migrations.test.js test/timed-access.test.js test/moderation.test.js test/guest-presence.test.js test/scoped-codes.test.js test/guest-removal.test.js",
+    "test": "node --test --test-concurrency=1 test/server.test.js test/migrations.test.js test/timed-access.test.js test/moderation.test.js test/guest-presence.test.js test/scoped-codes.test.js test/guest-removal.test.js test/recovery-key.test.js",
     "test:update": "bash test/update-flow.sh",
     "backup": "node scripts/backup-db.js"
   },
