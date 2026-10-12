@@ -368,6 +368,22 @@ people they share a server with.
 Presence and message responses carry each account's current `avatarUpdatedAt`, so
 changing your picture updates it everywhere, old messages included.
 
+## How long chat history is kept
+
+Persistent chat is kept for a number of months, then the oldest messages are deleted. The window is per
+server: **12 months by default**, and the owner can choose 3, 6, 9 or 12 (`PUT /api/servers/:id/retention`
+with `{ "months": 6 }`, owner only; the answer says how many messages the new window will remove at the next
+cleanup). Members see the current window as `retentionMonths` in `GET /api/servers/:id`.
+
+- **The cleanup** runs when the server starts and then every 24 hours (`RETENTION_EVERY_MS` to change it). It
+  counts calendar months back from now, and deletes messages older than that in persistent channels and rooms.
+  A shorter window takes effect at the next cleanup; a longer one never brings anything back.
+- **Not touched:** ephemeral spaces (they are wiped when empty, as before). Redacted messages and the music
+  bot's messages age out like anyone's. The log says how many were removed, never what they said.
+- **Updating** an existing install gives every server 12 months, so the first cleanup only removes messages
+  older than a year. `update.sh` backs the database up first.
+- Ids are not reused: migration 11 is the music link and 12 is this setting.
+
 ## Not built yet
 
 - LiveKit bundled with the server, so one setup installs both. Today you install

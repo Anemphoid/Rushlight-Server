@@ -88,3 +88,8 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   banner fields, settings sync across machines, and more than one admin per server
   (only the creator is an admin today). A client screen to list and revoke join
   codes is planned in the client repo; the endpoints already exist here.
+- History retention: `servers.retention_months` (3, 6, 9 or 12, default 12; migration 12). Only the owner changes it.
+  `purgeExpiredHistory` runs at start and every 24 h and deletes messages older than the window in PERSISTENT spaces
+  only (calendar months). Ephemeral spaces have their own wipe. When images arrive they must be deleted with
+  their messages in the same job. The log may count what was removed but must never print message content or names.
+

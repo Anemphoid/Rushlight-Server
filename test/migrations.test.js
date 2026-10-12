@@ -34,9 +34,9 @@ test('an existing database upgrades in place and keeps its data', async () => {
   oldDatabase(path)
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 6 migration/)
+    assert.match(srv.log(), /Applied 7 migration/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT revoked FROM join_codes').get().revoked, 0)
     assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_accounts_username_nocase'").get())
@@ -79,9 +79,9 @@ test('an install already at migration 6 (the released v0.2.0) applies the newer 
   oldDatabase(path, { upTo: 6 })
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 4 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account/)
+    assert.match(srv.log(), /Applied 5 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, persistent chat history is kept for a number of months per server/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM access_ends').get().n, 0)
     db.close()
@@ -103,9 +103,9 @@ test('an install at migration 7 (the released v0.3.0) gets scoped codes and its 
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 3 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account/)
+    assert.match(srv.log(), /Applied 4 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, persistent chat history is kept for a number of months per server/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
     const row = db.prepare('SELECT scope_type, scope_id FROM join_codes').get()
     assert.deepEqual(row, { scope_type: null, scope_id: null }) // old codes stay server-wide
     db.close()
@@ -130,7 +130,7 @@ test('an install at migration 8 (the released v0.4.1) keeps every account workin
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 2 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account/)
+    assert.match(srv.log(), /Applied 3 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, persistent chat history is kept for a number of months per server/)
     const db = new Database(path, { readonly: true })
     const cols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name)
     for (const c of ['recovery_key_hash', 'pending_recovery_key_hash', 'recovery_key_set_at', 'session_epoch']) assert.ok(cols.includes(c), c)
@@ -157,17 +157,38 @@ test('an install at migration 9 (the released v0.7.0) keeps every message, none 
   oldDatabase(path, { upTo: 9 })
   const seed = new Database(path)
   seed.prepare("INSERT INTO channels (server_id, name, mode, persistent, position, created_at) VALUES (1, 'main', 'both', 1, 0, 1)").run()
-  seed.prepare("INSERT INTO messages (channel_id, author_account_id, author_name, text, created_at) VALUES (1, 1, 'Anemphoid', 'written before redaction existed', 5)").run()
+  seed.prepare("INSERT INTO messages (channel_id, author_account_id, author_name, text, created_at) VALUES (1, 1, 'Anemphoid', 'written before redaction existed', " + Date.now() + ")").run()
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 1 migration\(s\): messages can be redacted when their author deletes their account/)
+    assert.match(srv.log(), /Applied 2 migration\(s\): messages can be redacted when their author deletes their account, persistent chat history is kept for a number of months per server/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
     assert.deepEqual(
       db.prepare('SELECT text, author_name, author_account_id, redacted FROM messages').get(),
       { text: 'written before redaction existed', author_name: 'Anemphoid', author_account_id: 1, redacted: 0 }
     )
+    db.close()
+  } finally {
+    await srv.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('an install at migration 10 (the released v0.8.0): every server gets a 12 month window and keeps its messages', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rushlight-mig-'))
+  const path = join(dir, 'v080.db')
+  oldDatabase(path, { upTo: 10 })
+  const seed = new Database(path)
+  seed.prepare("INSERT INTO channels (server_id, name, mode, persistent, position, created_at) VALUES (1, 'main', 'both', 1, 0, 1)").run()
+  seed.prepare("INSERT INTO messages (channel_id, author_account_id, author_name, text, created_at) VALUES (1, 1, 'Anemphoid', 'recent', ?)").run(Date.now() - 30 * 86400000)
+  seed.close()
+  const srv = await startServer({ dbPath: path })
+  try {
+    assert.match(srv.log(), /Applied 1 migration\(s\): persistent chat history is kept for a number of months per server/)
+    const db = new Database(path, { readonly: true })
+    assert.deepEqual(db.prepare('SELECT retention_months FROM servers').all(), [{ retention_months: 12 }])
+    assert.equal(db.prepare('SELECT text FROM messages').get().text, 'recent')
     db.close()
   } finally {
     await srv.stop()
