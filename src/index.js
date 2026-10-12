@@ -645,6 +645,10 @@ const ACCESS_ENDED_MESSAGE = {
 
 // The 403 for someone who is not a member. If they used to be, say why they are not.
 function notAMember(res, serverId, accountId) {
+  // A server that no longer exists was deleted: say so, rather than "removed", which reads like a kick.
+  if (!db.prepare('SELECT 1 FROM servers WHERE id = ?').get(Number(serverId))) {
+    return res.status(403).json({ error: 'This server was deleted.', reason: 'deleted' })
+  }
   const row = db
     .prepare('SELECT reason FROM access_ends WHERE server_id = ? AND account_id = ?')
     .get(Number(serverId), accountId)
@@ -1553,6 +1557,36 @@ app.patch('/api/servers/:id/members/:accountId', requireAuth, requireServerAdmin
   const account = db.prepare('SELECT username FROM accounts WHERE id = ?').get(targetId)
   res.json({ member: serializeMember({ ...updated, username: account.username }) })
 }))
+
+// Make someone an admin, or take it away. Owner only: an admin can't promote or demote.
+// No password, because it can be undone with the same button. Accounts only: a guest has no
+// membership row, so there is nobody to promote. The owner is always an admin and can't be
+// demoted (hand the server over instead). Becoming an admin clears a mute and any access
+// timer, because admins never expire.
+app.post('/api/servers/:id/members/:accountId/admin', requireAuth, requireServerOwner, (req, res) => {
+  const serverId = Number(req.params.id)
+  const targetId = Number(req.params.accountId)
+  if (!Number.isInteger(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'Only people with an account can be admins' })
+  }
+  const { admin } = req.body || {}
+  if (typeof admin !== 'boolean') return res.status(400).json({ error: 'admin must be true or false' })
+  const membership = getMembership(serverId, targetId)
+  if (!membership) return res.status(404).json({ error: 'That person is not a member of this server' })
+  if (ownerIdOf(serverId) === targetId) {
+    return res.status(400).json({ error: 'The owner is always an admin. Hand the server over to change who owns it.' })
+  }
+  if (admin) {
+    db.prepare(
+      'UPDATE server_members SET is_admin = 1, muted = 0, access_expires_at = NULL WHERE server_id = ? AND account_id = ?'
+    ).run(serverId, targetId)
+  } else {
+    db.prepare('UPDATE server_members SET is_admin = 0 WHERE server_id = ? AND account_id = ?').run(serverId, targetId)
+  }
+  const updated = getMembership(serverId, targetId)
+  const account = db.prepare('SELECT username FROM accounts WHERE id = ?').get(targetId)
+  res.json({ member: serializeMember({ ...updated, username: account.username, is_owner: 0 }) })
+})
 
 // Looks a code up and checks it can still be used. Returns the row, or sends
 // the error response and returns null.
