@@ -57,6 +57,9 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   and ends the session; `guestCodeOrRefuse` refuses it, because the signed token would
   otherwise rebuild the session on the next check-in. The code list keeps a used
   single-use code while a guest of it is live.
+- `auth.js` 401s carry `reason: session_ended | session_expired` for a dead session and nothing
+  for a wrong password; clients rely on that split, so keep it. Making or removing an admin is
+  owner-only (`POST .../members/:accountId/admin`).
 - Owner-only actions (`requireServerOwner`: transfer and delete server) need the owner's
   password, which is re-verified after the async hash and the ownership re-checked in a
   synchronous step. Admins who are not the owner are refused. Don't make anything else

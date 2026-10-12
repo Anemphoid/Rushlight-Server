@@ -217,6 +217,22 @@ routes (`ACCOUNT_LIMIT`):
 `GET /api/servers`, `GET /api/servers/:id` and the members list carry `isOwner`. No
 migration.
 
+### Admins, and why a request failed
+
+- `POST /api/servers/:id/members/:accountId/admin` with `{ admin: true | false }` makes a
+  member an admin or takes it away. **Owner only** (an admin can't promote or demote), no
+  password because the same button undoes it. Accounts only: a guest has no membership, so
+  there is nobody to promote (400). The owner is always an admin and can't be demoted (400;
+  hand the server over instead). Becoming an admin clears a mute and any access timer, since
+  admins never expire. It takes effect on the next request, and a client's regular check of the
+  server (`isAdmin`, `isOwner`) picks it up within seconds.
+- A **401 carries a `reason`** when the session itself is no longer good: `session_ended` (the
+  password was changed or reset, so the session ended) or `session_expired` (the token ran out
+  or the account is gone). A wrong password on a route that asks for one is also a 401 but has
+  no reason, so a client can tell them apart and only send the person to sign-in for the first.
+- A request about a **deleted server** gets `403` with `reason: "deleted"` and the message
+  "This server was deleted.", where a kick says "removed", an expiry "expired" and so on.
+
 ### Recovery keys, password change and reset
 
 There is no admin reset anywhere: a server admin has no account-level access, and the
