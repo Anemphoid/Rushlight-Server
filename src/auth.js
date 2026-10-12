@@ -60,16 +60,16 @@ function readPayload(req) {
   try {
     payload = jwt.verify(token, JWT_SECRET)
   } catch {
-    return { error: 'Invalid or expired session' }
+    return { error: 'Invalid or expired session', reason: 'session_expired' }
   }
   if (!payload.guest) {
     // A token is only good while its account exists and its password has not been changed
     // or reset since it was issued. Tokens from before sessions could end carry no epoch,
     // which counts as 0, the value every account started with.
     const row = sessionEpoch.get(payload.sub)
-    if (!row) return { error: 'Invalid or expired session' }
+    if (!row) return { error: 'Invalid or expired session', reason: 'session_expired' }
     if ((payload.ep || 0) !== row.session_epoch) {
-      return { error: 'Your password was changed, so this session ended. Please log in again.' }
+      return { error: 'Your password was changed, so this session ended. Please log in again.', reason: 'session_ended' }
     }
   }
   return { payload }
@@ -77,9 +77,11 @@ function readPayload(req) {
 
 // Accounts only — a guest token is rejected here, so nothing that needs a
 // real account can be reached with one.
+// A 401 that carries a `reason` means the session itself is no longer good (as opposed to a
+// wrong password on a route that asks for one), so a client knows to send the person to sign-in.
 export function requireAuth(req, res, next) {
-  const { payload, error } = readPayload(req)
-  if (error) return res.status(401).json({ error })
+  const { payload, error, reason } = readPayload(req)
+  if (error) return res.status(401).json(reason ? { error, reason } : { error })
   if (payload.guest) return res.status(401).json({ error: 'This needs an account' })
   req.account = payload
   next()
@@ -87,8 +89,8 @@ export function requireAuth(req, res, next) {
 
 // Accounts or guests: sets req.account or req.guest, whichever it is.
 export function requireAuthOrGuest(req, res, next) {
-  const { payload, error } = readPayload(req)
-  if (error) return res.status(401).json({ error })
+  const { payload, error, reason } = readPayload(req)
+  if (error) return res.status(401).json(reason ? { error, reason } : { error })
   if (payload.guest) req.guest = payload
   else req.account = payload
   next()
