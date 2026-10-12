@@ -136,6 +136,7 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
     }
   }
 
+  const activeSpaces = (serverId) => [...players.values()].filter((e) => e.serverId === serverId).map((e) => ({ type: e.type, spaceId: e.spaceId }))
   const stopForServer = (serverId) => stopWhere((e) => e.serverId === serverId)
   const stopForSpace = (type, spaceId) => stopWhere((e) => e.type === type && e.spaceId === spaceId)
 
@@ -355,5 +356,5 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
     return found.jf ? found.jf.cover(itemId) : null
   }
 
-  return { getLink, link, test, unlink, state, handleCommand, control, search, cover, sweep, stopForServer, stopForSpace, activeRooms: () => players.size }
+  return { getLink, link, test, unlink, state, handleCommand, control, search, cover, sweep, activeSpaces, stopForServer, stopForSpace, activeRooms: () => players.size }
 }

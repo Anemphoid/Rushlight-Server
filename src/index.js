@@ -418,6 +418,12 @@ function presenceForServer(serverId, onlyKey = null) {
     const rows = db.prepare(`SELECT id, avatar_updated_at FROM accounts WHERE id IN (${placeholders})`).all(...allIds)
     for (const r of rows) avatarUpdatedAt.set(r.id, r.avatar_updated_at)
   }
+  // Jellybox shows up like another person in the room it is playing in, flagged as a bot.
+  for (const { type, spaceId } of music.activeSpaces(serverId)) {
+    const key = spaceKey(type, spaceId)
+    if (onlyKey && key !== onlyKey) continue
+    if (!out[key]) out[key] = []
+  }
   for (const [key, space] of included) {
     out[key] = [...space.entries].map(([id, e]) => ({
       id,
@@ -426,6 +432,11 @@ function presenceForServer(serverId, onlyKey = null) {
       avatarUpdatedAt: avatarUpdatedAt.get(id) || null,
       ...(e.guest ? { guest: true } : {})
     }))
+  }
+  for (const { type, spaceId } of music.activeSpaces(serverId)) {
+    const key = spaceKey(type, spaceId)
+    if (onlyKey && key !== onlyKey) continue
+    out[key].push({ id: 'jellybox', name: BOT_NAME, avatarColor: null, avatarUpdatedAt: null, bot: true })
   }
   return out
 }

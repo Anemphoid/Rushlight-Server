@@ -499,3 +499,25 @@ test('addresses: cloud-metadata and link-local are refused, LAN and local are al
   }
   assert.equal(await checkAddress('http://127.0.0.1:8096/jelly/?x=1#y'), 'http://127.0.0.1:8096/jelly')
 })
+
+test('Jellybox shows in the tree like another person in its room, flagged as a bot, and leaves it when it leaves', async () => {
+  const w = await world()
+  const tree = async (who) => (await srv.call('GET', `/api/servers/${w.s.id}`, undefined, who.token)).data.presence
+  const key = `channel:${w.voice.id}`
+  await checkIn(w, w.member)
+  assert.deepEqual((await tree(w.owner))[key].map((p) => p.name), [w.member.username])
+  await ask(w, w.member, '/play sunrise')
+  const people = (await tree(w.owner))[key]
+  const bot = people.find((p) => p.bot)
+  assert.deepEqual(bot, { id: 'jellybox', name: 'Jellybox', avatarColor: null, avatarUpdatedAt: null, bot: true })
+  assert.equal(people.filter((p) => !p.bot).length, 1)
+  assert.equal(people.find((p) => p.name === w.member.username).bot, undefined)
+  // the check-in answer shows it too
+  const checkin = (await checkIn(w, w.member)).data.presence
+  assert.ok(checkin[key].some((p) => p.bot))
+  // other rooms are not affected
+  assert.ok(!((await tree(w.owner))[`channel:${w.text.id}`] || []).some((p) => p.bot))
+  // it is not a person: it does not keep an ephemeral room "occupied" after everyone has left
+  await srv.call('POST', '/api/presence/leave', {}, w.member.token)
+  await until(async () => !((await tree(w.owner))[key] || []).some((p) => p.bot), 10000)
+})
