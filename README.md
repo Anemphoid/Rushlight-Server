@@ -217,6 +217,31 @@ routes (`ACCOUNT_LIMIT`):
 `GET /api/servers`, `GET /api/servers/:id` and the members list carry `isOwner`. No
 migration.
 
+### Deleting an account
+
+`DELETE /api/me` with `{ password }`. **Permanent and immediate**; take a database backup before
+installing the release that adds it, because there is no way back. Migration 10 only adds a
+`messages.redacted` column, so it changes no data.
+
+- Needs the password (wrong: 401). An account that **owns a server is refused** with 409,
+  `reason: "owns_servers"` and `servers: [{ id, name }]`, because a server must not be left
+  without an owner. Hand each over (`POST /api/servers/:id/transfer`) or delete it first.
+- Everything below happens in one transaction: the account's **messages are wiped, not hidden**
+  (text and author name set to empty, avatar colour and author link cleared, `redacted = 1`, the
+  row kept so conversations still read in order); its memberships, bans and "access ended" notes go;
+  codes it made and bans it issued stay, with the "created by" link cleared; the avatar (stored on
+  the account row) goes with the row; the account row is deleted, which **frees the username**
+  for anyone, in any capitalization.
+- Before that, LiveKit is told to drop it from its voice rooms; afterwards its presence is
+  cleared and open persistence votes lose it (a vote it started is cancelled, one it was part of
+  is settled without it, and its name is scrubbed from any that remain in memory).
+- Every other window is signed out at once: a token for a missing account gets a 401 with
+  `reason: "session_expired"` and "This account no longer exists."
+- A redacted message comes back from the message routes as `{ id, authorId: null, author: null,
+  avatarColor: null, avatarUpdatedAt: null, text: "", createdAt, redacted: true }`, so nothing
+  identifying leaves the server. Every other message has `redacted: false`.
+- Rate limited like the other password routes (`ACCOUNT_LIMIT`).
+
 ### Admins, and why a request failed
 
 - `POST /api/servers/:id/members/:accountId/admin` with `{ admin: true | false }` makes a

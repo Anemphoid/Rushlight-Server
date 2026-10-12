@@ -217,6 +217,16 @@ export const migrations = [
         ALTER TABLE accounts ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0;
       `)
     }
+  },
+  {
+    id: 10,
+    name: 'messages can be redacted when their author deletes their account',
+    up(db) {
+      // 1 once the author has deleted their account. The text, name and avatar colour of such a
+      // message are wiped when it happens; the row stays so a conversation still reads in order.
+      // Only adds a column, so every existing message is unchanged (0).
+      db.exec('ALTER TABLE messages ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0')
+    }
   }
 ]
 

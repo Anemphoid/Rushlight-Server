@@ -57,6 +57,9 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   and ends the session; `guestCodeOrRefuse` refuses it, because the signed token would
   otherwise rebuild the session on the next check-in. The code list keeps a used
   single-use code while a guest of it is live.
+- Deleting an account (`DELETE /api/me`) is irreversible: password, owners refused, one transaction,
+  messages wiped (not hidden) and marked `redacted`, username freed. If you add a table that
+  references accounts, add it to that transaction (a test runs `PRAGMA foreign_key_check`).
 - `auth.js` 401s carry `reason: session_ended | session_expired` for a dead session and nothing
   for a wrong password; clients rely on that split, so keep it. Making or removing an admin is
   owner-only (`POST .../members/:accountId/admin`).
