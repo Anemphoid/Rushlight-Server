@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { startServer, newAccount } from './helpers.js'
 import { startFakeJellyfin, TOKEN, IDS } from './fake-jellyfin.js'
+import { checkAddress } from '../src/music/jellyfin.js'
 
 let srv, jelly, sinkDir
 before(async () => {
@@ -349,7 +350,7 @@ test('the panel: anyone in the server sees it, only admins press its buttons, an
   assert.equal((await srv.call('GET', `/api/servers/${w.s.id}/music/search?q=sun`, undefined, w.member.token)).status, 403)
   const found = await srv.call('GET', `/api/servers/${w.s.id}/music/search?q=sun`, undefined, w.admin.token)
   assert.equal(found.status, 200)
-  assert.ok(found.data.results.some((r) => r.kind === 'song' && r.title === 'Sunrise Song'))
+  assert.ok(found.data.results.some((r) => r.kind === 'song' && r.title === 'Sunrise Song' && r.albumId === IDS.albumA))
   assert.ok((await srv.call('GET', `/api/servers/${w.s.id}/music/search?q=four`, undefined, w.admin.token)).data.results.some((r) => r.kind === 'album'))
   assert.equal((await srv.call('GET', `/api/servers/${w.s.id}/music/search?q=`, undefined, w.admin.token)).status, 400)
   // a stranger gets nothing
@@ -460,7 +461,10 @@ test('deleting the channel or the server sends the bot away, and the link goes w
   await checkIn(w, w.member)
   await ask(w, w.member, '/play sunrise')
   await until(async () => (await state(w, w.member)).active)
+  const leftMarker = join(sinkDir, roomName(w) + '.left') // the test sink leaves this behind when the bot disconnects
+  assert.equal(existsSync(leftMarker), false)
   assert.equal((await srv.call('DELETE', `/api/servers/${w.s.id}/channels/${w.voice.id}`, undefined, w.owner.token)).status, 200)
+  await until(() => existsSync(leftMarker))
   const w2 = await world()
   await checkIn(w2, w2.member)
   await ask(w2, w2.member, '/play sunrise')
@@ -484,4 +488,14 @@ test('the bot name is reserved, and a deleted account is not mistaken for the bo
   const redacted = msgs.find((m) => m.redacted)
   assert.ok(redacted)
   assert.notEqual(redacted.bot, true)
+})
+
+test('addresses: cloud-metadata and link-local are refused, LAN and local are allowed', async () => {
+  for (const bad of ['http://169.254.169.254/', 'http://169.254.0.5:8096', 'http://[fe80::1]/', 'http://[::ffff:169.254.169.254]/', 'http://metadata.google.internal/', 'ftp://127.0.0.1', 'http://u:p@127.0.0.1/', 'nonsense']) {
+    await assert.rejects(checkAddress(bad), (e) => e.kind === 'address', bad)
+  }
+  for (const good of ['http://127.0.0.1:8096', 'http://10.0.0.5:8096/jelly', 'http://192.168.1.20:8096', 'http://[::1]:8096']) {
+    assert.ok(await checkAddress(good), good)
+  }
+  assert.equal(await checkAddress('http://127.0.0.1:8096/jelly/?x=1#y'), 'http://127.0.0.1:8096/jelly')
 })

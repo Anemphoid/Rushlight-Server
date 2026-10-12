@@ -20,6 +20,13 @@ function blockedAddress(ip) {
   let v = ip.toLowerCase()
   const mapped = v.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)
   if (mapped) v = mapped[1]
+  // URLs rewrite ::ffff:1.2.3.4 as ::ffff:102:304
+  const hex = v.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+  if (hex) {
+    const hi = parseInt(hex[1], 16)
+    const lo = parseInt(hex[2], 16)
+    v = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`
+  }
   if (net.isIPv4(v)) return v.startsWith('169.254.') || v === '0.0.0.0'
   if (net.isIPv6(v)) return /^fe[89ab]/.test(v) || v === '::' || v.startsWith('fd00:ec2:')
   return true
@@ -149,7 +156,9 @@ export class Jellyfin {
       id: String(it.Id),
       title: String(it.Name || 'Untitled'),
       artist: it.Type === 'MusicArtist' ? '' : (it.Artists && it.Artists[0]) || it.AlbumArtist || '',
-      album: it.Type === 'Audio' ? it.Album || '' : ''
+      album: it.Type === 'Audio' ? it.Album || '' : '',
+      // lets a song result offer "play the whole album"
+      ...(it.Type === 'Audio' && it.AlbumId ? { albumId: String(it.AlbumId) } : {})
     }))
   }
 

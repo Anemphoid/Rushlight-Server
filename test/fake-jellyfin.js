@@ -8,7 +8,7 @@ const hex = (n) => String(n).padStart(32, '0')
 export const IDS = { sunrise: hex(1), moon: hex(2), albumA: hex(10), a1: hex(11), a2: hex(12), a3: hex(13), a4: hex(14), artist: hex(20), bad: hex(99) }
 
 const SONGS = {
-  [IDS.sunrise]: { Id: IDS.sunrise, Name: 'Sunrise Song', Type: 'Audio', Artists: ['The Sunbeams'], Album: 'Sunny Album', RunTimeTicks: 1e7 * 1.5 },
+  [IDS.sunrise]: { Id: IDS.sunrise, Name: 'Sunrise Song', Type: 'Audio', Artists: ['The Sunbeams'], Album: 'Sunny Album', AlbumId: hex(10), RunTimeTicks: 1e7 * 1.5 },
   [IDS.moon]: { Id: IDS.moon, Name: 'Moonlight', Type: 'Audio', Artists: ['Nightingale'], Album: 'Dark Album', RunTimeTicks: 1e7 * 1.5 },
   [IDS.a1]: { Id: IDS.a1, Name: 'Track One', Type: 'Audio', Artists: ['Album Band'], Album: 'Four Tracks', RunTimeTicks: 1.5e7 },
   [IDS.a2]: { Id: IDS.a2, Name: 'Track Two', Type: 'Audio', Artists: ['Album Band'], Album: 'Four Tracks', RunTimeTicks: 1.5e7 },
