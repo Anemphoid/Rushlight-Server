@@ -899,6 +899,84 @@ app.post('/api/recover', recoverLimiter, asyncHandler(async (req, res) => {
   res.json(sessionResponse(fresh, { recoveryKey: issuePendingKey(account.id) }))
 }))
 
+// --- Deleting an account ---
+// Irreversible, and immediate. The person's messages stay in their rooms so conversations still
+// read in order, but their text, name and avatar colour are wiped from the database (not merely
+// hidden) and the rows are marked redacted. Their memberships, bans, votes, avatar, live voice and
+// presence go, and the account row itself, which frees the username. An owner has to hand each
+// server over or delete it first, so no server is left without an owner.
+
+// Open votes in memory: drop this account's part in them, and scrub its name from any that remain.
+function forgetAccountInVotes(accountId) {
+  for (const p of proposals.values()) {
+    if (p.proposerId === accountId) {
+      p.proposerName = 'REDACTED'
+      if (p.status === 'open') closeProposal(p, 'cancelled')
+    }
+    const entry = p.electorate.get(accountId)
+    if (entry) {
+      if (p.status === 'open') {
+        p.electorate.delete(accountId)
+        if (p.electorate.size === 0) closeProposal(p, 'cancelled')
+        else settle(p)
+      } else {
+        entry.name = 'REDACTED'
+      }
+    }
+  }
+}
+
+function serversOwnedBy(accountId) {
+  return db.prepare('SELECT id, name FROM servers WHERE owner_id = ? ORDER BY id').all(accountId)
+}
+
+app.delete('/api/me', accountSecretsLimiter, requireAuth, asyncHandler(async (req, res) => {
+  const { password } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const accountId = req.account.sub
+  const account = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(accountId)
+  if (!account || !(await verifyPassword(password, account.password_hash))) {
+    return res.status(401).json({ error: 'Incorrect password' })
+  }
+
+  const refuse = (owned) =>
+    res.status(409).json({
+      error:
+        `You own ${owned.map((s) => s.name).join(', ')}. Hand ${owned.length === 1 ? 'it' : 'each one'} to someone ` +
+        'else, or delete it, before you delete your account.',
+      reason: 'owns_servers',
+      servers: owned
+    })
+  if (serversOwnedBy(accountId).length) return refuse(serversOwnedBy(accountId))
+
+  // Voice first, while presence still says which rooms they are in (the same order kick uses).
+  const memberships = db.prepare('SELECT server_id FROM server_members WHERE account_id = ?').all(accountId)
+  for (const m of memberships) await disconnectFromServerVoice(m.server_id, accountId)
+
+  // All of it in one step, with the ownership checked again inside it, since the password
+  // check and the voice calls above took a moment.
+  const outcome = db.transaction(() => {
+    const owned = serversOwnedBy(accountId)
+    if (owned.length) return owned
+    db.prepare(
+      `UPDATE messages SET text = '', author_name = '', author_avatar_color = NULL, author_account_id = NULL, redacted = 1
+       WHERE author_account_id = ?`
+    ).run(accountId)
+    db.prepare('DELETE FROM server_members WHERE account_id = ?').run(accountId)
+    db.prepare('DELETE FROM server_bans WHERE account_id = ?').run(accountId)
+    db.prepare('UPDATE server_bans SET banned_by = NULL WHERE banned_by = ?').run(accountId)
+    db.prepare('UPDATE join_codes SET created_by = NULL WHERE created_by = ?').run(accountId)
+    db.prepare('DELETE FROM access_ends WHERE account_id = ?').run(accountId)
+    db.prepare('DELETE FROM accounts WHERE id = ?').run(accountId) // the avatar lives on this row
+    return null
+  })()
+  if (outcome) return refuse(outcome)
+
+  removePresence(accountId)
+  forgetAccountInVotes(accountId)
+  res.json({ deleted: true })
+}))
+
 // --- Avatars ---
 // A custom image lives on the account, not on every message or presence
 // heartbeat — sending image bytes that often would be a real bandwidth
@@ -1843,6 +1921,10 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
 // --- Messages (persisted; no real-time push yet — that needs presence) ---
 
 function serializeMessage(m) {
+  // The author deleted their account: nothing identifying is kept, and the client draws a redaction.
+  if (m.redacted) {
+    return { id: m.id, authorId: null, author: null, avatarColor: null, avatarUpdatedAt: null, text: '', createdAt: m.created_at, redacted: true }
+  }
   return {
     id: m.id,
     authorId: m.author_account_id,
@@ -1850,7 +1932,8 @@ function serializeMessage(m) {
     avatarColor: m.author_avatar_color, // frozen per-message, as it already was
     avatarUpdatedAt: m.current_avatar_updated_at || null, // live — reflects the author's avatar *now*
     text: m.text,
-    createdAt: m.created_at
+    createdAt: m.created_at,
+    redacted: false
   }
 }
 

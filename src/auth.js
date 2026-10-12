@@ -67,7 +67,7 @@ function readPayload(req) {
     // or reset since it was issued. Tokens from before sessions could end carry no epoch,
     // which counts as 0, the value every account started with.
     const row = sessionEpoch.get(payload.sub)
-    if (!row) return { error: 'Invalid or expired session', reason: 'session_expired' }
+    if (!row) return { error: 'This account no longer exists. Please log in again.', reason: 'session_expired' }
     if ((payload.ep || 0) !== row.session_epoch) {
       return { error: 'Your password was changed, so this session ended. Please log in again.', reason: 'session_ended' }
     }
