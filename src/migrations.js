@@ -244,6 +244,16 @@ export const migrations = [
         )
       `)
     }
+  },
+  {
+    // Ids are not reused: 11 is the Jellybox music link (its own release), so this one is 12.
+    id: 12,
+    name: 'persistent chat history is kept for a number of months per server',
+    up(db) {
+      // 12 for every existing server, so nothing is deleted on update that the owner has not chosen:
+      // the first cleanup only removes messages older than a year, and the owner can pick 3, 6, 9 or 12.
+      db.exec('ALTER TABLE servers ADD COLUMN retention_months INTEGER NOT NULL DEFAULT 12')
+    }
   }
 ]
 

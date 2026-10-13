@@ -1110,6 +1110,7 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
     name: server.name,
     isAdmin: !!req.membership.is_admin,
     isOwner: server.owner_id === req.account.sub,
+    retentionMonths: server.retention_months,
     channels: serializeTree(server.id),
     presence: presenceForServer(server.id),
     proposals: proposalsForServer(server.id, req.account.sub)
@@ -1205,6 +1206,59 @@ app.post('/api/servers/:id/transfer', accountSecretsLimiter, requireAuth, requir
   if (done === 'not-member') return res.status(404).json({ error: 'That person is not a member of this server' })
   res.json({ transferred: true, ownerId: targetId })
 }))
+
+// --- History retention ---------------------------------------------------
+// Persistent chat is kept for a number of months (3, 6, 9 or 12; the owner chooses, 12 by default), then a
+// daily job deletes the oldest messages. Ephemeral spaces are not touched here: they are wiped when empty.
+// Redacted messages and the music bot's messages age out the same way as anyone's. When images arrive they
+// must be deleted together with the messages that carry them.
+const RETENTION_CHOICES = [3, 6, 9, 12]
+const RETENTION_EVERY_MS = Number(process.env.RETENTION_EVERY_MS) || 24 * 60 * 60 * 1000
+
+// Calendar months back from `now`, so "3 months" on Oct 12 is Jul 12, not a fixed number of days.
+function retentionCutoff(months, now = Date.now()) {
+  const d = new Date(now)
+  d.setMonth(d.getMonth() - months)
+  return d.getTime()
+}
+
+const PERSISTENT_MESSAGES = `(
+  channel_id IN (SELECT id FROM channels WHERE server_id = @server AND persistent = 1)
+  OR room_id IN (SELECT rooms.id FROM rooms JOIN channels ON rooms.channel_id = channels.id
+                 WHERE channels.server_id = @server AND rooms.persistent = 1)
+)`
+
+function countExpiring(serverId, months, now = Date.now()) {
+  return db
+    .prepare(`SELECT COUNT(*) AS n FROM messages WHERE created_at < @cutoff AND ${PERSISTENT_MESSAGES}`)
+    .get({ server: serverId, cutoff: retentionCutoff(months, now) }).n
+}
+
+function purgeExpiredHistory(now = Date.now()) {
+  let total = 0
+  for (const s of db.prepare('SELECT id, retention_months FROM servers').all()) {
+    const months = RETENTION_CHOICES.includes(s.retention_months) ? s.retention_months : 12
+    total += db
+      .prepare(`DELETE FROM messages WHERE created_at < @cutoff AND ${PERSISTENT_MESSAGES}`)
+      .run({ server: s.id, cutoff: retentionCutoff(months, now) }).changes
+  }
+  return total
+}
+
+// Owner only (the owner decides how long people's words are kept). Shorter windows take effect at the next
+// cleanup, and the answer says how many messages that will remove, so the owner is not surprised.
+app.put('/api/servers/:id/retention', requireAuth, requireServerOwner, (req, res) => {
+  const { months, dryRun } = req.body || {}
+  if (!Number.isInteger(months) || !RETENTION_CHOICES.includes(months)) {
+    return res.status(400).json({ error: `months must be one of ${RETENTION_CHOICES.join(', ')}` })
+  }
+  // dryRun: only say how many messages this window would remove, and change nothing.
+  if (dryRun === true) {
+    return res.json({ retentionMonths: months, willDeleteAtNextCleanup: countExpiring(Number(req.params.id), months), saved: false })
+  }
+  db.prepare('UPDATE servers SET retention_months = ? WHERE id = ?').run(months, req.params.id)
+  res.json({ retentionMonths: months, willDeleteAtNextCleanup: countExpiring(Number(req.params.id), months), saved: true })
+})
 
 // --- Channels ---
 
@@ -2387,6 +2441,16 @@ process.on('uncaughtException', (err) => {
 
 const PORT = process.env.PORT || 4000
 const wiped = wipeAllEphemeralOnStartup()
+function runRetention() {
+  try {
+    const n = purgeExpiredHistory()
+    if (n) console.log(`Removed ${n} message(s) older than their server's history window`)
+  } catch (err) {
+    console.error('retention cleanup:', err)
+  }
+}
+runRetention()
+setInterval(runRetention, RETENTION_EVERY_MS).unref()
 purgeOldAccessEnds()
 setInterval(purgeOldAccessEnds, 60 * 60 * 1000).unref()
 setInterval(() => {

@@ -98,3 +98,8 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   keyed by LiveKit room name, and must be stopped when a space, server or link goes away. Tests use
   `JELLYBOX_TEST_SINK_DIR` (frames to a file) because a test cannot listen to a LiveKit room: real
   publishing through `@livekit/rtc-node` is only checked on a real install. Needs ffmpeg on the machine.
+- History retention: `servers.retention_months` (3, 6, 9 or 12, default 12; migration 12). Only the owner changes it.
+  `purgeExpiredHistory` runs at start and every 24 h and deletes messages older than the window in PERSISTENT spaces
+  only (calendar months). Ephemeral spaces have their own wipe. When images arrive they must be deleted with
+  their messages in the same job. The log may count what was removed but must never print message content or names.
+
