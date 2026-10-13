@@ -8,6 +8,7 @@ const FRAME_BYTES = FRAME_SAMPLES * 2
 const LEAD_MS = 400 // how far ahead of real time frames may run
 const REALTIME = process.env.JELLYBOX_REALTIME !== '0'
 const MAX_RETRIES = 5
+const MAX_FAIL_STREAK = 3 // songs in a row that will not play before shuffle gives up
 const CLOSE_ENOUGH_MS = 3000 // a song may end this much short of its tagged length without it being a break
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -34,6 +35,7 @@ export class Player {
     this.resumeWaiters = []
     this.shuffleAll = false // play random songs from the whole library, topping the queue up as it runs low
     this.fillPromise = null
+    this.failStreak = 0 // songs in a row that failed to play
     this.retries = 0 // times the current song's stream broke and was picked up again
     this.lastTrack = null
   }
@@ -252,6 +254,15 @@ export class Player {
           }
           this.say(`I lost the stream to "${track.title}" and couldn't pick it up again, so I'm moving on.`)
           outcome = 'failed'
+        }
+        if (outcome === 'ended') this.failStreak = 0
+        if (outcome === 'failed') this.failStreak++
+        if (this.shuffleAll && this.failStreak >= MAX_FAIL_STREAK) {
+          // shuffle would otherwise pick another song, fail again, and keep at it for ever
+          this.shuffleAll = false
+          this.queue = this.queue.filter((t) => t.addedBy !== 'Shuffle')
+          this.failStreak = 0
+          this.say("A few songs in a row wouldn't play, so I've turned shuffle off. Is Jellyfin okay?")
         }
         if (outcome === 'ended' || outcome === 'failed') {
           if (this.current === track) {

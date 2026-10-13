@@ -38,7 +38,7 @@ function page(list, q) {
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==', 'base64')
 
 // dropFirstAfterBytes: the first request for each song is cut off after that many bytes, like a network blip.
-export async function startFakeJellyfin({ seconds = 1.5, dropFirstAfterBytes = 0, dropAlways = false, ticks = 0 } = {}) {
+export async function startFakeJellyfin({ seconds = 1.5, dropFirstAfterBytes = 0, dropAlways = false, failAudio = false, ticks = 0 } = {}) {
   const dropped = new Set()
   // a short real audio file, made once with ffmpeg
   const audio = execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=${seconds}`, '-ar', '44100', '-ac', '2', '-f', 'wav', 'pipe:1'], { maxBuffer: 1e8 })
@@ -92,6 +92,7 @@ export async function startFakeJellyfin({ seconds = 1.5, dropFirstAfterBytes = 0
       let m = /^\/Audio\/([0-9a-f]+)\/stream$/.exec(p)
       if (m) {
         if (!SONGS[m[1]]) return json(404, {})
+        if (failAudio) return json(500, {})
         res.writeHead(200, { 'content-type': 'audio/wav' })
         if (dropFirstAfterBytes && (dropAlways || !dropped.has(m[1]))) {
           dropped.add(m[1])

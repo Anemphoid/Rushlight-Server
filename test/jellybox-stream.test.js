@@ -20,8 +20,8 @@ async function until(fn, ms = 20000) {
   }
 }
 
-async function setup({ seconds, drop = 0, always = false, tagged = seconds, timeoutMs = '1500' }) {
-  const jelly = await startFakeJellyfin({ seconds, dropFirstAfterBytes: drop, dropAlways: always, ticks: tagged * 1e7 })
+async function setup({ seconds, drop = 0, always = false, failAudio = false, tagged = seconds, timeoutMs = '1500' }) {
+  const jelly = await startFakeJellyfin({ seconds, dropFirstAfterBytes: drop, dropAlways: always, failAudio, ticks: tagged * 1e7 })
   const sinkDir = mkdtempSync(join(tmpdir(), 'jellybox-stream-'))
   const srv = await startServer({
     env: { JELLYBOX_TEST_SINK_DIR: sinkDir, JELLYBOX_REQUEST_TIMEOUT_MS: timeoutMs, JELLYBOX_RATE_MAX: '100', ACCOUNT_LIMIT: '1000', MUSIC_LINK_LIMIT: '1000' }
@@ -112,6 +112,25 @@ test('a song shorter than its tagged length ends quietly, with no scare', async 
     assert.ok(Math.abs(w.pcm() - 192000) < 20000, 'expected about 2 s of audio, got ' + w.pcm() + ' bytes')
     const said = await w.bot()
     assert.ok(!said.some((t) => /tripped|lost/i.test(t)), said.join(' | '))
+  } finally {
+    await w.cleanup()
+  }
+})
+
+test('shuffle gives up kindly when song after song will not play, instead of trying for ever', async () => {
+  const w = await setup({ seconds: 2, failAudio: true, timeoutMs: '10000' })
+  try {
+    await w.say('/shuffle')
+    await until(async () => (await w.bot()).some((t) => /turned shuffle off/.test(t)), 30000)
+    const st = await w.state()
+    assert.equal(st.shuffleAll, false)
+    const requests = w.jelly.audioRequests()
+    assert.ok(requests >= 3 && requests <= 5, 'asked for the audio ' + requests + ' times')
+    const said = await w.bot()
+    assert.ok(said.filter((t) => /tripped/.test(t)).length <= 3, said.join(' | '))
+    await sleep(2000)
+    assert.equal(w.jelly.audioRequests(), requests, 'it must stop asking')
+    assert.equal(w.pcm(), 0)
   } finally {
     await w.cleanup()
   }
