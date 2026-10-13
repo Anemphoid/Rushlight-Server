@@ -49,7 +49,9 @@ async function world() {
 }
 
 // write a message at a chosen age, straight into the database
+const everWritten = []
 function put({ channel = null, room = null, text, at, author = null, name = 'someone', redacted = 0 }) {
+  everWritten.push(text)
   const db = new Database(srv.dbPath)
   const info = db
     .prepare('INSERT INTO messages (channel_id, room_id, author_account_id, author_name, text, created_at, redacted) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -206,4 +208,10 @@ test('the server says what it did, without naming anyone', async () => {
   db.close()
   assert.ok(everything.length > 0)
   for (const text of everything) assert.ok(!srv.log().includes(text), 'the log must not repeat message text: ' + text)
+})
+
+test('across everything this file did, no message text ever reached the server log', async () => {
+  const long = everWritten.filter((x) => x.length >= 12)
+  assert.ok(long.length >= 5)
+  for (const text of long) assert.ok(!srv.log().includes(text), 'the log repeated: ' + text)
 })
