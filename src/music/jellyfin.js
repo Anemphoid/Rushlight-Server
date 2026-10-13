@@ -6,7 +6,7 @@ import dns from 'node:dns/promises'
 import net from 'node:net'
 
 const MAX_REDIRECTS = 3
-const TIMEOUT_MS = 10000
+const TIMEOUT_MS = Number(process.env.JELLYBOX_REQUEST_TIMEOUT_MS) || 10000
 const BLOCKED_HOSTS = new Set(['metadata.google.internal', 'metadata', 'instance-data'])
 
 export class JellyfinError extends Error {
@@ -71,21 +71,28 @@ export class Jellyfin {
     return { 'X-Emby-Authorization': auth, Accept: 'application/json', ...extra }
   }
 
-  async request(path, { method = 'GET', body, headers } = {}) {
+  // streaming: the timeout only covers waiting for Jellyfin to start answering. A song streams for as long as
+  // it plays, so a timer over the whole body would cut every long song off after the timeout. Everything
+  // else (searches, cover art) is small, so its timer covers the whole answer.
+  async request(path, { method = 'GET', body, headers, streaming = false } = {}) {
     const origin = new URL(this.base).origin
     let url = this.base + path
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       let res
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
       try {
         res = await fetch(url, {
           method,
           redirect: 'manual',
-          signal: AbortSignal.timeout(TIMEOUT_MS),
+          signal: streaming ? controller.signal : AbortSignal.timeout(TIMEOUT_MS),
           headers: this.headers({ ...(body ? { 'content-type': 'application/json' } : {}), ...headers }),
           body: body ? JSON.stringify(body) : undefined
         })
       } catch {
         throw new JellyfinError('Could not reach Jellyfin at that address', 'unreachable')
+      } finally {
+        clearTimeout(timer) // headers are here (or it failed): a streamed body gets no timer
       }
       if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
         const next = new URL(res.headers.get('location'), url)
@@ -182,7 +189,7 @@ export class Jellyfin {
 
   // The audio of one song, as a web stream, or throws.
   async audio(id) {
-    const res = await this.request(`/Audio/${encodeURIComponent(id)}/stream?static=true`, { headers: { Accept: '*/*' } })
+    const res = await this.request(`/Audio/${encodeURIComponent(id)}/stream?static=true`, { headers: { Accept: '*/*' }, streaming: true })
     if (!res.ok || !res.body) throw new JellyfinError(`Jellyfin could not play that one (${res.status})`, 'failed')
     return res.body
   }
