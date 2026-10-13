@@ -81,7 +81,7 @@ const botSays = async (w, count = 1, space = w.voice) => {
 const lastBot = async (w, after, space = w.voice) => {
   const got = await until(async () => {
     // the "Now playing ... (picked by ...)" announcements come separately from the reply to a command
-    const bots = (await messages(w, space)).filter((m) => m.bot && m.id > after && !/\(picked by /.test(m.text))
+    const bots = (await messages(w, space)).filter((m) => m.bot && m.id > after && !/\(picked by |just joined the room/.test(m.text))
     return bots.length ? bots : null
   })
   return got[got.length - 1].text
@@ -308,7 +308,7 @@ test('/help is friendly and shows the right list; unknown slash text is just a m
   assert.match(member, /Hi, I'm Jellybox/)
   assert.match(member, /\/play/)
   assert.match(member, /Admins can also/)
-  assert.match(await ask(w, w.admin, '/help'), /Admin controls: \/pause/)
+  assert.match(await ask(w, w.admin, '/help'), /Admin controls: \/shuffle .*\/stop, \/pause/)
   // the owner and an admin are both admins here; a member is not
   const before = await lastId(w)
   await say(w, w.member, '/shrug')
@@ -520,4 +520,161 @@ test('Jellybox shows in the tree like another person in its room, flagged as a b
   // it is not a person: it does not keep an ephemeral room "occupied" after everyone has left
   await srv.call('POST', '/api/presence/leave', {}, w.member.token)
   await until(async () => !((await tree(w.owner))[key] || []).some((p) => p.bot), 10000)
+})
+
+test('/stop ends the song and empties the queue but the bot stays; it is for admins and the owner', async () => {
+  const w = await world()
+  await checkIn(w, w.member)
+  await checkIn(w, w.admin)
+  assert.match(await ask(w, w.admin, '/stop'), /nothing to stop/i)
+  await ask(w, w.member, '/play four tracks')
+  await until(async () => (await state(w, w.member)).nowPlaying)
+  const refused = await ask(w, w.member, '/stop')
+  assert.match(refused, /\/stop is one of the admin-only controls/)
+  assert.ok((await state(w, w.member)).nowPlaying, 'a member must not be able to stop it')
+  const said = await ask(w, w.admin, '/stop')
+  assert.match(said, /stopped|All quiet/i)
+  assert.match(said, /Track One by Album Band|Track Two|Track Three/)
+  const st = await state(w, w.member)
+  assert.equal(st.nowPlaying, null)
+  assert.deepEqual(st.queue, [])
+  assert.equal(st.active, true, 'the bot stays in the room')
+  assert.equal(st.state, 'idle')
+  // and it can be asked again afterwards
+  assert.match(await ask(w, w.member, '/play moonlight'), /Moonlight/)
+  await until(async () => (await state(w, w.member)).nowPlaying)
+  // the panel button does the same
+  const url = `/api/music/channel/${w.voice.id}/control`
+  assert.equal((await srv.call('POST', url, { action: 'stop' }, w.member.token)).status, 403)
+  const r = await srv.call('POST', url, { action: 'stop' }, w.admin.token)
+  assert.equal(r.status, 200)
+  assert.equal(r.data.nowPlaying, null)
+  assert.match(await ask(w, w.member, '/help'), /Admins can also \/shuffle, \/stop/)
+})
+
+test('when Jellybox joins a room it says what everyone can do, once, and again when it comes back', async () => {
+  const w = await world()
+  await checkIn(w, w.member)
+  const before = await lastId(w)
+  await say(w, w.member, '/play sunrise')
+  const greeting = await until(async () => (await messages(w)).find((m) => m.bot && m.id > before && /just joined the room/.test(m.text)))
+  for (const cmd of ['/play', '/search', '/queue', '/nowplaying', '/skip', '/help']) assert.ok(greeting.text.includes(cmd), cmd)
+  for (const adminOnly of ['/pause', '/stop', '/clear', '/volume', '/seek']) assert.ok(!greeting.text.includes(adminOnly), adminOnly + ' is not for everyone')
+  // it comes before the first song announcement
+  const all = await messages(w)
+  const now = all.find((m) => m.bot && /^Now playing/.test(m.text) && m.id > before)
+  assert.ok(now.id > greeting.id)
+  // not again for the next song
+  await ask(w, w.member, '/play moonlight')
+  assert.equal((await messages(w)).filter((m) => m.bot && /just joined the room/.test(m.text)).length, 1)
+  // everyone leaves, the bot leaves; a new /play brings it back, and it says hello again
+  await srv.call('POST', '/api/presence/leave', {}, w.member.token)
+  await until(async () => !(await state(w, w.owner)).active, 10000)
+  await checkIn(w, w.member)
+  await say(w, w.member, '/play sunrise')
+  await until(async () => (await messages(w)).filter((m) => m.bot && /just joined the room/.test(m.text)).length === 2)
+})
+
+test('browsing the library: alphabetical artists, albums and songs, by letter and page, for admins', async () => {
+  const w = await world()
+  const base = `/api/servers/${w.s.id}/music/browse`
+  const names = async (qs, who = w.admin) => {
+    const r = await srv.call('GET', `${base}?${qs}`, undefined, who.token)
+    assert.equal(r.status, 200, JSON.stringify(r.data))
+    return r.data
+  }
+  const artists = await names('kind=artists')
+  assert.deepEqual(artists.items.map((i) => i.title), ['Album Band', 'Nightingale', 'The Sunbeams'])
+  assert.ok(artists.items.every((i) => i.kind === 'artist'))
+  assert.equal(artists.total, 3)
+  assert.deepEqual((await names('kind=artists&letter=n')).items.map((i) => i.title), ['Nightingale'])
+  assert.deepEqual((await names('kind=artists&letter=Z')).items, [])
+  assert.deepEqual((await names('kind=artists&start=1')).items.map((i) => i.title), ['Nightingale', 'The Sunbeams'])
+  const albums = await names('kind=albums')
+  assert.deepEqual(albums.items.map((i) => i.title), ['Dark Album', 'Four Tracks', 'Sunny Album'])
+  assert.ok(albums.items.every((i) => i.kind === 'album'))
+  assert.equal(albums.items[0].artist, 'Nightingale')
+  const songs = await names('kind=songs')
+  assert.equal(songs.items[0].title, '1999') // digits and symbols sort first
+  assert.ok(songs.items.every((i) => i.kind === 'song' && typeof i.durationMs === 'number'))
+  assert.deepEqual((await names('kind=songs&letter=%23')).items.map((i) => i.title), ['1999'])
+  assert.ok(songs.items.map((i) => i.title).slice(1).every((t, i, a) => i === 0 || a[i - 1].localeCompare(t) <= 0), 'alphabetical')
+
+  // inside an artist, and inside an album
+  const insideArtist = await srv.call('GET', `${base}/artist/${IDS.artistSun}`, undefined, w.admin.token)
+  assert.deepEqual(insideArtist.data.items.map((i) => [i.kind, i.title]), [['album', 'Sunny Album']])
+  const insideAlbum = await srv.call('GET', `${base}/album/${IDS.albumA}`, undefined, w.admin.token)
+  assert.deepEqual(insideAlbum.data.items.map((i) => i.title), ['Track One', 'Track Two', 'Track Three', 'Track Four'])
+
+  // picking something from the browse list plays it, like the search results
+  await checkIn(w, w.admin)
+  const play = await srv.call('POST', `/api/music/channel/${w.voice.id}/control`, { action: 'play-now', itemId: IDS.albumSunny, kind: 'album' }, w.admin.token)
+  assert.equal(play.status, 200)
+})
+
+test('browsing is for admins and the owner, checks its input, and is hidden when nothing is linked', async () => {
+  const w = await world()
+  const base = `/api/servers/${w.s.id}/music/browse`
+  for (const who of [w.member, w.other]) {
+    assert.equal((await srv.call('GET', `${base}?kind=artists`, undefined, who.token)).status, 403)
+    assert.equal((await srv.call('GET', `${base}/album/${IDS.albumA}`, undefined, who.token)).status, 403)
+  }
+  assert.equal((await srv.call('GET', `${base}?kind=artists`)).status, 401)
+  const stranger = await newAccount(srv)
+  assert.equal((await srv.call('GET', `${base}?kind=artists`, undefined, stranger.token)).status, 403)
+  assert.equal((await srv.call('GET', `${base}?kind=artists`, undefined, w.owner.token)).status, 200)
+  for (const qs of ['', 'kind=genres', 'kind=artists&letter=AB', 'kind=artists&letter=%3B', 'kind=artists&start=-1', 'kind=artists&start=abc', 'kind=artists&start=1.5', 'kind=artists&start=999999999']) {
+    assert.equal((await srv.call('GET', `${base}?${qs}`, undefined, w.admin.token)).status, 400, qs)
+  }
+  assert.equal((await srv.call('GET', `${base}/song/${IDS.sunrise}`, undefined, w.admin.token)).status, 400)
+  assert.equal((await srv.call('GET', `${base}/album/not-an-id!`, undefined, w.admin.token)).status, 400)
+  const bare = await world({ link: false })
+  assert.equal((await srv.call('GET', `/api/servers/${bare.s.id}/music/browse?kind=artists`, undefined, bare.owner.token)).status, 409)
+})
+
+test('/shuffle plays random songs from the whole library until it is turned off or stopped; admins only', async () => {
+  const w = await world()
+  await checkIn(w, w.member)
+  await checkIn(w, w.admin)
+  assert.match(await ask(w, w.member, '/shuffle'), /\/shuffle is one of the admin-only controls/)
+  assert.equal((await state(w, w.member)).active, false, 'a member must not start it')
+  assert.match(await ask(w, w.admin, '/shuffle'), /Shuffle is on|a little of everything/)
+  const first = await until(async () => {
+    const s = await state(w, w.member)
+    return s.nowPlaying ? s : null
+  })
+  assert.equal(first.shuffleAll, true)
+  assert.equal(first.nowPlaying.addedBy, 'Shuffle')
+  assert.match(await ask(w, w.admin, '/shuffle'), /already on/)
+  // it keeps going on its own, song after song, with nobody queueing anything
+  await until(async () => (await messages(w)).filter((m) => m.bot && /^Now playing/.test(m.text)).length >= 3, 20000)
+  assert.equal((await state(w, w.member)).shuffleAll, true)
+  assert.ok((await state(w, w.member)).queue.length > 0, 'the queue is topped up while it runs')
+  // off: what is already lined up still plays out, then it goes quiet and stops asking for more
+  assert.match(await ask(w, w.admin, '/shuffle off'), /Shuffle is off/)
+  assert.equal((await state(w, w.member)).shuffleAll, false)
+  const announced = (await messages(w)).filter((m) => m.bot && /^Now playing/.test(m.text)).length
+  await until(async () => (await state(w, w.member)).nowPlaying === null, 40000)
+  const total = (await messages(w)).filter((m) => m.bot && /^Now playing/.test(m.text)).length
+  assert.ok(total >= announced && total <= announced + 4, 'it plays out the queue and no further')
+  await sleep(1500)
+  assert.equal((await state(w, w.member)).nowPlaying, null)
+
+  // /stop ends shuffle for good; the panel button works for admins only
+  await ask(w, w.admin, '/shuffle')
+  await until(async () => (await state(w, w.member)).nowPlaying)
+  assert.match(await ask(w, w.admin, '/stop'), /stopped|All quiet/i)
+  const st = await state(w, w.member)
+  assert.equal(st.shuffleAll, false)
+  assert.equal(st.nowPlaying, null)
+  await sleep(1500)
+  assert.equal((await state(w, w.member)).nowPlaying, null, 'stopped means stopped, shuffle must not refill')
+  const url = `/api/music/channel/${w.voice.id}/control`
+  assert.equal((await srv.call('POST', url, { action: 'shuffle', value: true }, w.member.token)).status, 403)
+  const on = await srv.call('POST', url, { action: 'shuffle', value: true }, w.admin.token)
+  assert.equal(on.status, 200)
+  assert.equal(on.data.shuffleAll, true)
+  const off = await srv.call('POST', url, { action: 'shuffle', value: false }, w.admin.token)
+  assert.equal(off.data.shuffleAll, false)
+  await srv.call('POST', url, { action: 'stop' }, w.admin.token)
 })

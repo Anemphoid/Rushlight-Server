@@ -148,6 +148,20 @@ export class Jellyfin {
     }
   }
 
+  // One library item as the panel and the chat show it.
+  static shape(it) {
+    return {
+      kind: it.Type === 'MusicAlbum' ? 'album' : it.Type === 'MusicArtist' ? 'artist' : 'song',
+      id: String(it.Id),
+      title: String(it.Name || 'Untitled'),
+      artist: it.Type === 'MusicArtist' ? '' : (it.Artists && it.Artists[0]) || it.AlbumArtist || '',
+      album: it.Type === 'Audio' ? it.Album || '' : '',
+      ...(it.Type === 'Audio' && it.RunTimeTicks ? { durationMs: Math.round(it.RunTimeTicks / 10000) } : {}),
+      // lets a song result offer "play the whole album"
+      ...(it.Type === 'Audio' && it.AlbumId ? { albumId: String(it.AlbumId) } : {})
+    }
+  }
+
   // Songs, albums and artists matching a search, in the order Jellyfin ranks them.
   async search(term, limit = 8) {
     const q = new URLSearchParams({
@@ -158,15 +172,38 @@ export class Jellyfin {
       Fields: 'AlbumArtist'
     })
     const data = await this.json(`/Items?${q}`)
-    return (data.Items || []).map((it) => ({
-      kind: it.Type === 'MusicAlbum' ? 'album' : it.Type === 'MusicArtist' ? 'artist' : 'song',
-      id: String(it.Id),
-      title: String(it.Name || 'Untitled'),
-      artist: it.Type === 'MusicArtist' ? '' : (it.Artists && it.Artists[0]) || it.AlbumArtist || '',
-      album: it.Type === 'Audio' ? it.Album || '' : '',
-      // lets a song result offer "play the whole album"
-      ...(it.Type === 'Audio' && it.AlbumId ? { albumId: String(it.AlbumId) } : {})
-    }))
+    return (data.Items || []).map(Jellyfin.shape)
+  }
+
+  // Browsing without searching: the whole library of artists, albums or songs in alphabetical order, a page at
+  // a time, optionally only those starting with a letter ('#' is everything before A: digits and symbols).
+  async browse(kind, { letter = '', start = 0, limit = 50 } = {}) {
+    const q = new URLSearchParams({ SortBy: 'SortName', SortOrder: 'Ascending', StartIndex: String(start), Limit: String(limit), Fields: 'AlbumArtist', Recursive: 'true' })
+    if (letter === '#') q.set('NameLessThan', 'A')
+    else if (letter) q.set('NameStartsWith', letter)
+    let path = '/Items'
+    if (kind === 'artists') path = '/Artists/AlbumArtists'
+    else q.set('IncludeItemTypes', kind === 'albums' ? 'MusicAlbum' : 'Audio')
+    const data = await this.json(`${path}?${q}`)
+    const items = (data.Items || []).map((it) => Jellyfin.shape(kind === 'artists' ? { ...it, Type: 'MusicArtist' } : it))
+    return { total: Number.isFinite(data.TotalRecordCount) ? data.TotalRecordCount : start + items.length, items }
+  }
+
+  // What is inside one entry: an artist's albums, or an album's songs in track order.
+  async children(kind, id, limit = 100) {
+    if (kind === 'album') {
+      return (await this.tracksFor('album', id, limit)).map((t) => ({ kind: 'song', id: t.id, title: t.title, artist: t.artist, album: t.album, durationMs: t.durationMs }))
+    }
+    const q = new URLSearchParams({ IncludeItemTypes: 'MusicAlbum', Recursive: 'true', AlbumArtistIds: id, SortBy: 'ProductionYear,SortName', Limit: String(limit), Fields: 'AlbumArtist' })
+    const data = await this.json(`/Items?${q}`)
+    return (data.Items || []).map(Jellyfin.shape)
+  }
+
+  // A random handful of songs from the whole library (for shuffle).
+  async randomSongs(limit = 8) {
+    const q = new URLSearchParams({ IncludeItemTypes: 'Audio', Recursive: 'true', SortBy: 'Random', Limit: String(limit), Fields: 'AlbumArtist' })
+    const data = await this.json(`/Items?${q}`)
+    return (data.Items || []).map(Jellyfin.track)
   }
 
   // The songs behind a result: the song itself, an album in track order, or an artist's songs.

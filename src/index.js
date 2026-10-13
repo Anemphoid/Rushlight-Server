@@ -2204,6 +2204,37 @@ app.get('/api/servers/:id/music/search', musicLimiter, requireAuth, requireServe
   }
 }))
 
+// Browse the library without searching: alphabetical artists, albums or songs, a page at a time (admins, like search).
+const BROWSE_KINDS = new Set(['artists', 'albums', 'songs'])
+app.get('/api/servers/:id/music/browse', musicLimiter, requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const { kind } = req.query
+  const letter = typeof req.query.letter === 'string' ? req.query.letter.toUpperCase() : ''
+  const start = req.query.start === undefined ? 0 : Number(req.query.start)
+  if (typeof kind !== 'string' || !BROWSE_KINDS.has(kind)) return res.status(400).json({ error: 'kind must be artists, albums or songs' })
+  if (letter && !/^[A-Z#]$/.test(letter)) return res.status(400).json({ error: 'letter must be A to Z or #' })
+  if (!Number.isInteger(start) || start < 0 || start > 100000) return res.status(400).json({ error: 'start must be a whole number' })
+  try {
+    const out = await music.browse(Number(req.params.id), kind, { letter, start, limit: 50 })
+    if (out === null) return res.status(409).json({ error: 'Music is not set up' })
+    res.json({ kind, letter, start, ...out })
+  } catch (err) {
+    musicProblem(res, err)
+  }
+}))
+
+app.get('/api/servers/:id/music/browse/:kind/:itemId', musicLimiter, requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const { kind, itemId } = req.params
+  if (kind !== 'artist' && kind !== 'album') return res.status(400).json({ error: 'kind must be artist or album' })
+  if (!isItemId(itemId)) return res.status(400).json({ error: 'Bad item' })
+  try {
+    const items = await music.children(Number(req.params.id), kind, itemId)
+    if (items === null) return res.status(409).json({ error: 'Music is not set up' })
+    res.json({ kind, items })
+  } catch (err) {
+    musicProblem(res, err)
+  }
+}))
+
 app.get('/api/servers/:id/music/cover/:itemId', musicLimiter, requireAuth, requireServerMember, asyncHandler(async (req, res) => {
   if (!isItemId(req.params.itemId)) return res.status(400).json({ error: 'Bad item' })
   let img = null
