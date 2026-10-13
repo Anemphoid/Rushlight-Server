@@ -59,6 +59,8 @@ test('a song longer than the request timeout still plays all the way through', a
     await until(async () => (await w.state()).state === 'playing')
     await until(async () => (await w.state()).state === 'idle', 30000)
     assert.ok(w.pcm() >= EIGHT_SECONDS - 20000, 'only ' + w.pcm() + ' bytes of audio reached the room')
+    // in one go: the timeout must not have cut the stream (the retry would paper over it, but it is a symptom)
+    assert.equal(w.jelly.audioRequests(), 1, 'the stream was cut and had to be picked up again')
     const said = await w.bot()
     assert.ok(!said.some((t) => /tripped|couldn't|lost/i.test(t)), said.join(' | '))
   } finally {
