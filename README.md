@@ -423,6 +423,32 @@ cleanup). Members see the current window as `retentionMonths` in `GET /api/serve
   older than a year. `update.sh` backs the database up first.
 - Ids are not reused: migration 11 is the music link and 12 is this setting.
 
+## Pictures in chat
+
+Members can send a picture as its own message: `POST /api/channels/:id/images` or `POST /api/rooms/:id/images`
+with the picture as the raw request body and its type as `Content-Type` (`image/jpeg`, `image/png` or
+`image/webp`; no GIF), and an optional caption in `?text=` (up to 1000 characters). The answer is the new
+message, with `image: { id, mime, width, height }`; messages in the list carry the same field (`null` when
+there is none). The bytes are fetched with `GET /api/images/:id`, which needs the sign-in token.
+
+- **Checked and cleaned.** The server confirms the bytes really are that image type (not just the label),
+  rejects anything over 40 million pixels, and removes everything that could carry personal details: EXIF
+  (camera, time, GPS), XMP, JPEG comments, PNG text and time chunks, WebP EXIF/XMP, and anything after the end
+  of the picture. The colour profile, palette, transparency and animation chunks stay. The picture itself is not
+  decoded or re-encoded, so it comes back byte for byte apart from what was removed. A JPEG's rotation flag is
+  EXIF, so it goes too: the app bakes the rotation in before sending, so photos stay the right way up.
+- **Limits.** 5 MB a picture (`IMAGE_MAX_BYTES`), 10 pictures a minute per person (`IMAGE_LIMIT`), and 100 MB
+  per person per 24 hours (`IMAGE_DAILY_BYTES`).
+- **Who can see it.** Only members of that space's server. Anyone else, and an unknown id, gets a plain 404,
+  so an id reveals nothing. Guests have no account, so they can neither send nor fetch. The answer is sent
+  `nosniff`, with a CSP that allows nothing, and cached privately for good (an id never changes).
+- **How long it lives.** A picture is tied to its message by database triggers, so it goes whichever way the
+  message goes: the daily history cleanup, an ephemeral space emptying, a room, channel or server being
+  deleted, or the author deleting their account (the message stays, redacted, with no picture).
+- **Storage.** Pictures sit in the database (table `message_images`, migration 13), by id and apart from the
+  message, so listing messages never reads picture bytes. Updating an install only adds the table.
+- There is no way yet for an admin to remove a single picture early; it goes with its message.
+
 ## Not built yet
 
 - LiveKit bundled with the server, so one setup installs both. Today you install

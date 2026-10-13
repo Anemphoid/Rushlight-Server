@@ -34,7 +34,7 @@ test('an existing database upgrades in place and keeps its data', async () => {
   oldDatabase(path)
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 8 migration/)
+    assert.match(srv.log(), /Applied 9 migration/)
     const db = new Database(path, { readonly: true })
     assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
@@ -79,7 +79,7 @@ test('an install already at migration 6 (the released v0.2.0) applies the newer 
   oldDatabase(path, { upTo: 6 })
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 6 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server/)
+    assert.match(srv.log(), /Applied 7 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture/)
     const db = new Database(path, { readonly: true })
     assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
@@ -103,7 +103,7 @@ test('an install at migration 7 (the released v0.3.0) gets scoped codes and its 
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 5 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server/)
+    assert.match(srv.log(), /Applied 6 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture/)
     const db = new Database(path, { readonly: true })
     assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     const row = db.prepare('SELECT scope_type, scope_id FROM join_codes').get()
@@ -130,7 +130,7 @@ test('an install at migration 8 (the released v0.4.1) keeps every account workin
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 4 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server/)
+    assert.match(srv.log(), /Applied 5 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture/)
     const db = new Database(path, { readonly: true })
     const cols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name)
     for (const c of ['recovery_key_hash', 'pending_recovery_key_hash', 'recovery_key_set_at', 'session_epoch']) assert.ok(cols.includes(c), c)
@@ -161,7 +161,7 @@ test('an install at migration 9 (the released v0.7.0) keeps every message, none 
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 3 migration\(s\): messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server/)
+    assert.match(srv.log(), /Applied 4 migration\(s\): messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture/)
     const db = new Database(path, { readonly: true })
     assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
     assert.deepEqual(
@@ -185,7 +185,7 @@ test('an install at migration 10 (the released v0.8.0) gains the empty music tab
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 2 migration\(s\): a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server/)
+    assert.match(srv.log(), /Applied 3 migration\(s\): a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture/)
     const db = new Database(path, { readonly: true })
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM server_music').get().n, 0)
     assert.equal(db.prepare('SELECT text FROM messages').get().text, 'before the music bot')

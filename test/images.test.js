@@ -62,6 +62,7 @@ test('things that are not the picture they claim to be are refused', () => {
     ['a cut-off JPEG', JPEG.subarray(0, 100), 'image/jpeg'],
     ['a cut-off PNG', PNG.subarray(0, 60), 'image/png'],
     ['a cut-off WebP', WEBP.subarray(0, 30), 'image/webp'],
+    ['a WebP cut off between chunks, picture missing', WEBP.subarray(0, WEBP.indexOf('VP8 ')), 'image/webp'],
     ['an enormous picture (decompression bomb)', huge, 'image/png'],
     ['nothing', Buffer.alloc(0), 'image/png']
   ]
