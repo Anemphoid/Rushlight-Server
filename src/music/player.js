@@ -7,6 +7,8 @@ import { FRAME_MS, FRAME_SAMPLES } from './sinks.js'
 const FRAME_BYTES = FRAME_SAMPLES * 2
 const LEAD_MS = 400 // how far ahead of real time frames may run
 const REALTIME = process.env.JELLYBOX_REALTIME !== '0'
+const MAX_RETRIES = 5
+const CLOSE_ENOUGH_MS = 3000 // a song may end this much short of its tagged length without it being a break
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 export class Player {
@@ -30,6 +32,8 @@ export class Player {
     this.stopped = false
     this.connected = false
     this.resumeWaiters = []
+    this.retries = 0 // times the current song's stream broke and was picked up again
+    this.lastTrack = null
   }
 
   get positionMs() {
@@ -170,6 +174,10 @@ export class Player {
           this.startAt = 0
         }
         const track = this.current
+        if (this.lastTrack !== track) {
+          this.lastTrack = track
+          this.retries = 0
+        }
         const gen = ++this.gen
         this.framesSent = 0
         this.t0 = null
@@ -184,6 +192,17 @@ export class Player {
           outcome = 'failed'
         }
         if (this.stopped) break
+        if (outcome === 'broken') {
+          // The stream died part way (a network blip, Jellyfin restarting, a long pause): carry on from where it
+          // stopped, a few times, rather than skipping a song nobody asked to skip.
+          if (this.retries < MAX_RETRIES && this.current === track) {
+            this.retries++
+            this.startAt = this.breakAt
+            continue
+          }
+          this.say(`I lost the stream to "${track.title}" and couldn't pick it up again, so I'm moving on.`)
+          outcome = 'failed'
+        }
         if (outcome === 'ended' || outcome === 'failed') {
           if (this.current === track) {
             if (outcome === 'ended') this.history.push(track)
@@ -209,7 +228,11 @@ export class Player {
     this.proc = proc
     proc.on('error', () => {})
     proc.stdin.on('error', () => {})
-    input.on('error', () => proc.kill('SIGKILL'))
+    let inputFailed = false
+    input.on('error', () => {
+      inputFailed = true
+      proc.stdin.end() // let ffmpeg play out what it already has, then we carry on from there
+    })
     input.pipe(proc.stdin)
     let buf = Buffer.alloc(0)
     let sentAny = false
@@ -227,7 +250,16 @@ export class Player {
         }
       }
       if (gen !== this.gen) return 'interrupted'
-      if (!sentAny) throw new Error('ffmpeg produced no audio')
+      const at = this.startAt + this.framesSent * FRAME_MS
+      if (inputFailed || (sentAny && track.durationMs && at < track.durationMs - CLOSE_ENOUGH_MS)) {
+        this.breakAt = at
+        return 'broken'
+      }
+      // Nothing more came out when we carried on from a break: the song is over (its tagged length was a little long).
+      if (!sentAny) {
+        if (this.startAt > 0) return 'ended'
+        throw new Error('ffmpeg produced no audio')
+      }
       return 'ended'
     } finally {
       input.destroy()

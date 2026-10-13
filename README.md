@@ -401,7 +401,9 @@ still runs and the bot says it couldn't get into the room.
   when nothing is linked), `POST .../control` (admins and the owner, who must be in the room),
   `GET /api/servers/:id/music/search?q=` (admins) and `.../music/cover/:itemId` (members).
 - **Streaming:** each song is fetched from Jellyfin, decoded by ffmpeg and sent to the room as 20 ms
-  frames. Nothing is downloaded or stored. One bot per room; it leaves 5 seconds after the room empties
+  frames. The request timeout (10 s, `JELLYBOX_REQUEST_TIMEOUT_MS`) only covers waiting for Jellyfin to start
+  answering, never the song itself. If a stream breaks part way it is picked up again where it stopped, up to
+  five times, and then Jellybox says so and moves on. Nothing is downloaded or stored. One bot per room; it leaves 5 seconds after the room empties
   (`JELLYBOX_LEAVE_MS`), when the owner unlinks, or when the room, channel or server is deleted.
   Players live in memory, so a restart empties the queues.
 

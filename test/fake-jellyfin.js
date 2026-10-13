@@ -19,7 +19,9 @@ const ALBUM = { Id: IDS.albumA, Name: 'Four Tracks', Type: 'MusicAlbum', AlbumAr
 const ARTIST = { Id: IDS.artist, Name: 'Album Band', Type: 'MusicArtist' }
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==', 'base64')
 
-export async function startFakeJellyfin({ seconds = 1.5 } = {}) {
+// dropFirstAfterBytes: the first request for each song is cut off after that many bytes, like a network blip.
+export async function startFakeJellyfin({ seconds = 1.5, dropFirstAfterBytes = 0, dropAlways = false, ticks = 0 } = {}) {
+  const dropped = new Set()
   // a short real audio file, made once with ffmpeg
   const audio = execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', `sine=frequency=440:duration=${seconds}`, '-ar', '44100', '-ac', '2', '-f', 'wav', 'pipe:1'], { maxBuffer: 1e8 })
   const requests = []
@@ -49,12 +51,12 @@ export async function startFakeJellyfin({ seconds = 1.5 } = {}) {
       if (p === '/System/Info') return json(200, { ServerName: 'Fake Jelly' })
       if (p === '/Items') {
         const q = url.searchParams
-        const all = [...Object.values(SONGS), ALBUM, ARTIST]
+        const all = [...Object.values(SONGS), ALBUM, ARTIST].map((i) => (ticks && i.Type === 'Audio' ? { ...i, RunTimeTicks: ticks } : i)).map((i) => (ticks && i.Type === 'Audio' ? { ...i, RunTimeTicks: ticks } : i))
         if (q.get('searchTerm')) {
           const t = q.get('searchTerm').toLowerCase()
           return json(200, { Items: all.filter((i) => i.Name.toLowerCase().includes(t) || (i.Album || '').toLowerCase().includes(t)) })
         }
-        if (q.get('Ids')) return json(200, { Items: q.get('Ids').split(',').map((i) => SONGS[i]).filter(Boolean) })
+        if (q.get('Ids')) return json(200, { Items: q.get('Ids').split(',').map((i) => SONGS[i]).filter(Boolean).map((i) => (ticks ? { ...i, RunTimeTicks: ticks } : i)) })
         if (q.get('ParentId') === IDS.albumA || q.get('ArtistIds') === IDS.artist) return json(200, { Items: [SONGS[IDS.a1], SONGS[IDS.a2], SONGS[IDS.a3], SONGS[IDS.a4]] })
         return json(200, { Items: [] })
       }
@@ -62,6 +64,11 @@ export async function startFakeJellyfin({ seconds = 1.5 } = {}) {
       if (m) {
         if (!SONGS[m[1]]) return json(404, {})
         res.writeHead(200, { 'content-type': 'audio/wav' })
+        if (dropFirstAfterBytes && (dropAlways || !dropped.has(m[1]))) {
+          dropped.add(m[1])
+          res.write(audio.subarray(0, dropFirstAfterBytes))
+          return setTimeout(() => res.destroy(), 50)
+        }
         return res.end(audio)
       }
       m = /^\/Items\/([0-9a-f]+)\/Images\/Primary$/.exec(p)
@@ -78,6 +85,7 @@ export async function startFakeJellyfin({ seconds = 1.5 } = {}) {
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
+    audioRequests: () => requests.filter((r) => r.path.startsWith('/Audio/')).length,
     stop: () => new Promise((r) => server.close(r))
   }
 }
