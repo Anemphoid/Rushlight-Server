@@ -1231,12 +1231,16 @@ function purgeExpiredHistory(now = Date.now()) {
 // Owner only (the owner decides how long people's words are kept). Shorter windows take effect at the next
 // cleanup, and the answer says how many messages that will remove, so the owner is not surprised.
 app.put('/api/servers/:id/retention', requireAuth, requireServerOwner, (req, res) => {
-  const { months } = req.body || {}
+  const { months, dryRun } = req.body || {}
   if (!Number.isInteger(months) || !RETENTION_CHOICES.includes(months)) {
     return res.status(400).json({ error: `months must be one of ${RETENTION_CHOICES.join(', ')}` })
   }
+  // dryRun: only say how many messages this window would remove, and change nothing.
+  if (dryRun === true) {
+    return res.json({ retentionMonths: months, willDeleteAtNextCleanup: countExpiring(Number(req.params.id), months), saved: false })
+  }
   db.prepare('UPDATE servers SET retention_months = ? WHERE id = ?').run(months, req.params.id)
-  res.json({ retentionMonths: months, willDeleteAtNextCleanup: countExpiring(Number(req.params.id), months) })
+  res.json({ retentionMonths: months, willDeleteAtNextCleanup: countExpiring(Number(req.params.id), months), saved: true })
 })
 
 // --- Channels ---

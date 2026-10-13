@@ -109,6 +109,23 @@ test('the answer says how many messages the new window will remove, counting onl
   assert.equal((await setMonths(w, w.owner, 3)).data.willDeleteAtNextCleanup, 2)
 })
 
+test('a dry run says what a window would remove and changes nothing', async () => {
+  const w = await world()
+  put({ channel: w.channel.id, text: 'five months', at: monthsAgo(5) })
+  const dry = await srv.call('PUT', `/api/servers/${w.s.id}/retention`, { months: 3, dryRun: true }, w.owner.token)
+  assert.equal(dry.status, 200)
+  assert.equal(dry.data.saved, false)
+  assert.equal(dry.data.willDeleteAtNextCleanup >= 0, true)
+  assert.equal((await getServer(w, w.owner)).retentionMonths, 12)
+  // not the owner: refused even for a dry run; a bad number: refused too
+  assert.equal((await srv.call('PUT', `/api/servers/${w.s.id}/retention`, { months: 3, dryRun: true }, w.admin.token)).status, 403)
+  assert.equal((await srv.call('PUT', `/api/servers/${w.s.id}/retention`, { months: 5, dryRun: true }, w.owner.token)).status, 400)
+  // "dryRun" must be exactly true to count as one
+  const real = await srv.call('PUT', `/api/servers/${w.s.id}/retention`, { months: 9, dryRun: 'yes' }, w.owner.token)
+  assert.equal(real.data.saved, true)
+  assert.equal((await getServer(w, w.owner)).retentionMonths, 9)
+})
+
 test('the cleanup removes the oldest persistent messages and keeps the rest', async () => {
   const w = await world()
   put({ channel: w.channel.id, text: 'channel old', at: monthsAgo(12, 2) })
@@ -151,10 +168,15 @@ test('ephemeral spaces are not touched by it', async () => {
   const eph = (await srv.call('POST', `/api/servers/${w.s.id}/channels`, { name: 'temp', mode: 'text', persistent: false }, w.owner.token)).data
   await srv.call('POST', '/api/presence', { type: 'channel', id: eph.id }, w.owner.token)
   await setMonths(w, w.owner, 3)
+  // an ephemeral room inside a persistent channel is just as safe
+  const ephRoom = (await srv.call('POST', `/api/servers/${w.s.id}/channels/${w.channel.id}/rooms`, { name: 'temp room', mode: 'text', persistent: false }, w.owner.token)).data
+  await srv.call('POST', '/api/presence', { type: 'room', id: ephRoom.id }, w.admin.token)
+  put({ room: ephRoom.id, text: 'old ephemeral room message', at: monthsAgo(9) })
   put({ channel: eph.id, text: 'old but ephemeral and occupied', at: monthsAgo(9) })
   put({ channel: w.channel.id, text: 'old persistent', at: monthsAgo(9) })
   await until(() => texts('channel_id = ?', w.channel.id).length === 0)
   assert.deepEqual(texts('channel_id = ?', eph.id), ['old but ephemeral and occupied'])
+  assert.deepEqual(texts('room_id = ?', ephRoom.id), ['old ephemeral room message'])
 })
 
 test('redacted messages and the bot age out the same way as anyone\'s', async () => {
@@ -178,4 +200,10 @@ test('the server says what it did, without naming anyone', async () => {
   assert.match(srv.log(), /Removed \d+ message\(s\) older than their server's history window/)
   assert.ok(!srv.log().includes('a very private sentence'))
   assert.ok(!srv.log().includes('PrivatePerson'))
+  // nor anything else that is in the database
+  const db = new Database(srv.dbPath, { readonly: true })
+  const everything = db.prepare("SELECT text FROM messages WHERE length(text) >= 12").all().map((r) => r.text)
+  db.close()
+  assert.ok(everything.length > 0)
+  for (const text of everything) assert.ok(!srv.log().includes(text), 'the log must not repeat message text: ' + text)
 })
