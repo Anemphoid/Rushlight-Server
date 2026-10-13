@@ -7,6 +7,7 @@ import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { db } from './db.js'
 import { generateCode } from './wordlist.js'
 import { createMusic, BOT_NAME, JellyfinError, isItemId } from './music/index.js'
+import { inspectImage, ALLOWED_IMAGE_MIME } from './images.js'
 import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches } from './recoverykey.js'
 import {
   hashPassword,
@@ -1997,7 +1998,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
 function serializeMessage(m) {
   // The author deleted their account: nothing identifying is kept, and the client draws a redaction.
   if (m.redacted) {
-    return { id: m.id, authorId: null, author: null, avatarColor: null, avatarUpdatedAt: null, text: '', createdAt: m.created_at, redacted: true }
+    return { id: m.id, authorId: null, author: null, avatarColor: null, avatarUpdatedAt: null, text: '', createdAt: m.created_at, redacted: true, image: null }
   }
   return {
     id: m.id,
@@ -2009,7 +2010,9 @@ function serializeMessage(m) {
     createdAt: m.created_at,
     redacted: false,
     // The music bot's messages have no account behind them.
-    bot: m.author_account_id == null
+    bot: m.author_account_id == null,
+    // One picture at most; its bytes come from GET /api/images/:id (members only).
+    image: m.image_id ? { id: m.image_id, mime: m.image_mime, width: m.image_width, height: m.image_height } : null
   }
 }
 
@@ -2042,9 +2045,11 @@ function listMessages(kind, req, res) {
   const spaceId = kind === 'channel' ? req.params.channelId : req.params.roomId
   const messages = db
     .prepare(
-      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at
+      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
+              mi.id AS image_id, mi.mime AS image_mime, mi.width AS image_width, mi.height AS image_height
        FROM (SELECT * FROM messages WHERE ${column} = ? ORDER BY id DESC LIMIT 200) m
        LEFT JOIN accounts ON accounts.id = m.author_account_id
+       LEFT JOIN message_images mi ON mi.message_id = m.id
        ORDER BY m.id`
     )
     .all(spaceId)
@@ -2060,8 +2065,10 @@ function insertMessage(kind, spaceId, accountId, name, avatarColor, text) {
     .run(kind === 'channel' ? spaceId : null, kind === 'room' ? spaceId : null, accountId, name, avatarColor, text, Date.now())
   return db
     .prepare(
-      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at
-       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id WHERE m.id = ?`
+      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
+              mi.id AS image_id, mi.mime AS image_mime, mi.width AS image_width, mi.height AS image_height
+       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id
+       LEFT JOIN message_images mi ON mi.message_id = m.id WHERE m.id = ?`
     )
     .get(info.lastInsertRowid)
 }
@@ -2107,6 +2114,89 @@ function postMessage(kind, req, res) {
     }
   }
 }
+
+// --- Pictures in chat ---
+// A picture is sent as the raw request body (no base64 overhead), as its own message, with an optional
+// caption in ?text=. The server checks it is really the image type it claims, strips EXIF/XMP and
+// other metadata (src/images.js), and stores it by id, apart from the message. Only members of the
+// space's server can fetch it, and it goes away with its message, whichever way the message goes.
+const MAX_IMAGE_BYTES = Number(process.env.IMAGE_MAX_BYTES) || 5 * 1024 * 1024
+const IMAGE_DAILY_BYTES = Number(process.env.IMAGE_DAILY_BYTES) || 100 * 1024 * 1024 // per person, per 24 hours
+const imageBody = express.raw({ type: ALLOWED_IMAGE_MIME, limit: MAX_IMAGE_BYTES })
+const imageLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.IMAGE_LIMIT) || 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `account-${req.account ? req.account.sub : 'none'}`,
+  message: { error: 'Too many pictures at once. Wait a minute and try again.' }
+})
+
+function postImage(kind, req, res) {
+  const buffer = req.body
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return res.status(400).json({ error: 'Send the picture as the request body (image/jpeg, image/png or image/webp)' })
+  }
+  const mime = String(req.get('content-type') || '').split(';')[0].trim().toLowerCase()
+  const caption = typeof req.query.text === 'string' ? req.query.text.trim() : ''
+  if (caption.length > 1000) return res.status(400).json({ error: 'The caption is too long' })
+  const checked = inspectImage(buffer, mime)
+  if (!checked.ok) return res.status(400).json({ error: checked.error })
+
+  const used = db
+    .prepare(
+      `SELECT COALESCE(SUM(mi.size), 0) AS n FROM message_images mi JOIN messages m ON m.id = mi.message_id
+       WHERE m.author_account_id = ? AND mi.created_at > ?`
+    )
+    .get(req.account.sub, Date.now() - 24 * 60 * 60 * 1000).n
+  if (used + checked.clean.length > IMAGE_DAILY_BYTES) {
+    return res.status(429).json({ error: "You've shared a lot of pictures today. Try again tomorrow." })
+  }
+
+  const spaceId = Number(kind === 'channel' ? req.params.channelId : req.params.roomId)
+  const messageId = db.transaction(() => {
+    const m = insertMessage(kind, spaceId, req.account.sub, req.account.username, cleanColor(req.query.avatarColor), caption)
+    db.prepare(
+      'INSERT INTO message_images (message_id, mime, width, height, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(m.id, mime, checked.width, checked.height, checked.clean.length, checked.clean, Date.now())
+    return m.id
+  })()
+  const message = db
+    .prepare(
+      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
+              mi.id AS image_id, mi.mime AS image_mime, mi.width AS image_width, mi.height AS image_height
+       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id
+       LEFT JOIN message_images mi ON mi.message_id = m.id WHERE m.id = ?`
+    )
+    .get(messageId)
+  res.json(serializeMessage(message))
+}
+
+app.post('/api/channels/:channelId/images', requireAuth, requireSpaceMember('channel', 'channelId'), imageLimiter, imageBody, (req, res) =>
+  postImage('channel', req, res)
+)
+app.post('/api/rooms/:roomId/images', requireAuth, requireSpaceMember('room', 'roomId'), imageLimiter, imageBody, (req, res) =>
+  postImage('room', req, res)
+)
+
+// Needs the sign-in token (the app fetches it and shows the bytes), and answers 404, never 403, to
+// anyone who is not a member of the space's server, so an id reveals nothing.
+app.get('/api/images/:imageId', requireAuth, (req, res) => {
+  const row = db
+    .prepare(
+      `SELECT mi.mime, mi.data, m.channel_id, m.room_id FROM message_images mi
+       JOIN messages m ON m.id = mi.message_id WHERE mi.id = ?`
+    )
+    .get(Number(req.params.imageId))
+  if (!row) return res.status(404).json({ error: 'Not found' })
+  const serverId = row.channel_id ? serverIdForSpace('channel', row.channel_id) : serverIdForSpace('room', row.room_id)
+  if (!serverId || !getMembership(serverId, req.account.sub)) return res.status(404).json({ error: 'Not found' })
+  res.set('Content-Type', row.mime)
+  res.set('X-Content-Type-Options', 'nosniff')
+  res.set('Content-Security-Policy', "default-src 'none'; sandbox")
+  res.set('Cache-Control', 'private, max-age=31536000, immutable') // an image never changes under its id
+  res.send(row.data)
+})
 
 app.get('/api/channels/:channelId/messages', requireAuth, requireSpaceMember('channel', 'channelId'), (req, res) =>
   listMessages('channel', req, res)
