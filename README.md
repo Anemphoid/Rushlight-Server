@@ -391,15 +391,16 @@ still runs and the bot says it couldn't get into the room.
   The address is checked when linking and testing; it is not re-resolved on every song.
 - **Commands** typed in the chat of a voice room, by someone who is in that room: `/play` (a song,
   album or artist, or a number from `/search`), `/search`, `/queue`, `/nowplaying` (`/np`), `/skip`
-  and `/help` for everyone; `/pause`, `/resume`, `/previous`, `/volume`, `/seek`, `/clear` and
-  `/remove` for admins and the owner. The person's message stays as typed and Jellybox answers in the
+  and `/help` for everyone; `/stop` (ends the song, empties the queue, the bot stays), `/shuffle` (random songs from the whole library until
+  `/shuffle off` or `/stop`), `/pause`, `/resume`, `/previous`, `/volume`, `/seek`, `/clear` and `/remove` for admins
+  and the owner. When Jellybox joins a room it posts a short note of what everyone can use. The person's message stays as typed and Jellybox answers in the
   same chat (messages come back with `bot: true`). One person may have `JELLYBOX_QUEUE_CAP`
   songs (default 10) in the lineup, counting the one playing; admins are exempt. Commands are
   rate-limited per person (`JELLYBOX_RATE_MAX` per `JELLYBOX_RATE_WINDOW_MS`, default 6 per 10 s).
   The name "Jellybox" cannot be registered as a username.
 - **Panel routes:** `GET /api/music/:channel|room/:id/state` (any member; says `available: false`
   when nothing is linked), `POST .../control` (admins and the owner, who must be in the room),
-  `GET /api/servers/:id/music/search?q=` (admins) and `.../music/cover/:itemId` (members).
+  `GET /api/servers/:id/music/search?q=` and `GET .../music/browse?kind=artists|albums|songs&letter=A&start=0` (an alphabetical page of 50; `.../browse/artist|album/:itemId` lists what is inside one) (admins) and `.../music/cover/:itemId` (members).
 - **Streaming:** each song is fetched from Jellyfin, decoded by ffmpeg and sent to the room as 20 ms
   frames. The request timeout (10 s, `JELLYBOX_REQUEST_TIMEOUT_MS`) only covers waiting for Jellyfin to start
   answering, never the song itself. If a stream breaks part way it is picked up again where it stopped, up to

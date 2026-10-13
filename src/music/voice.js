@@ -34,6 +34,10 @@ export const say = {
   queueHeader: (n) => `Coming up (${n} song${n === 1 ? '' : 's'}):`,
   skipped: (t) => pick([`Skipped ${t}. On to the next one!`, `Okay, ${t} is out. Moving along.`]),
   nothingToSkip: () => "There's nothing playing, so there's nothing for me to skip!",
+  stopped: (t) => (t ? pick([`Okay, stopped. ${t} is done and the queue is cleared. I'm still here if you want more.`, `All quiet now. I stopped ${t} and cleared the queue, but I'll hang around.`]) : "Nothing was playing, so there's nothing to stop. The queue is empty too."),
+  shuffleOn: () => pick(["Shuffle is on! I'll keep playing random songs from the whole library until someone says /stop.", "Here we go, a little of everything. I'll keep shuffling the whole library until /stop."]),
+  shuffleOff: () => "Shuffle is off. I'll finish what's already lined up and then go quiet.",
+  shuffleAlready: () => "Shuffle is already on. Say /shuffle off to turn it off, or /stop to end everything.",
   paused: () => pick(["Paused. I'll hold my place until you say /resume.", "Holding it right there. Say /resume when you're ready."]),
   alreadyPaused: () => "I'm already paused. Say /resume and I'll pick it back up.",
   notPaused: () => "I'm not paused, the music is already going!",
@@ -51,6 +55,16 @@ export const say = {
   badRemove: (n) => (n === 0 ? "The queue is empty, so there's nothing to remove." : `Tell me which one to remove, from 1 to ${n}, like /remove 2.`),
   failedToJoin: () => "I couldn't get into the voice room just now. Try again in a moment?",
   unlinked: () => "The music library was unlinked, so I'm heading out. Thanks for the tunes!",
+  joined: () =>
+    [
+      "Hi everyone, I'm Jellybox, and I've just joined the room! Anyone in here can use:",
+      '/play name - play a song, album or artist',
+      '/search name - look something up',
+      '/queue - see what is coming up',
+      '/nowplaying - see what is playing',
+      '/skip - skip the current song',
+      '/help - the full list (admins have a few extra controls)'
+    ].join('\n'),
   leaving: () => "Looks like the room's empty, so I'm heading out. Call me back with /play any time!",
   help: (isAdmin) =>
     [
@@ -60,7 +74,7 @@ export const say = {
       '/queue - see what is coming up',
       '/nowplaying - see what is playing',
       '/skip - skip the current song',
-      isAdmin ? 'Admin controls: /pause, /resume, /previous, /volume 0-100, /seek 1:30, /clear, /remove 2' : 'Admins can also /pause, /resume, /previous, /volume, /seek, /clear and /remove.'
+      isAdmin ? 'Admin controls: /shuffle (or /shuffle off), /stop, /pause, /resume, /previous, /volume 0-100, /seek 1:30, /clear, /remove 2' : 'Admins can also /shuffle, /stop, /pause, /resume, /previous, /volume, /seek, /clear and /remove.'
     ].join('\n')
 }
 

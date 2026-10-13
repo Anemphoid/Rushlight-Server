@@ -8,6 +8,7 @@ const FRAME_BYTES = FRAME_SAMPLES * 2
 const LEAD_MS = 400 // how far ahead of real time frames may run
 const REALTIME = process.env.JELLYBOX_REALTIME !== '0'
 const MAX_RETRIES = 5
+const MAX_FAIL_STREAK = 3 // songs in a row that will not play before shuffle gives up
 const CLOSE_ENOUGH_MS = 3000 // a song may end this much short of its tagged length without it being a break
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -32,6 +33,9 @@ export class Player {
     this.stopped = false
     this.connected = false
     this.resumeWaiters = []
+    this.shuffleAll = false // play random songs from the whole library, topping the queue up as it runs low
+    this.fillPromise = null
+    this.failStreak = 0 // songs in a row that failed to play
     this.retries = 0 // times the current song's stream broke and was picked up again
     this.lastTrack = null
   }
@@ -44,6 +48,7 @@ export class Player {
     return {
       state: this.state,
       volume: this.volume,
+      shuffleAll: this.shuffleAll,
       nowPlaying: this.current
         ? { ...pub(this.current), positionMs: Math.min(this.positionMs, this.current.durationMs || this.positionMs) }
         : null,
@@ -84,12 +89,56 @@ export class Player {
     for (const w of this.resumeWaiters.splice(0)) w()
     return true
   }
+  // Ends the current song and empties the queue, but stays in the room.
+  stopPlayback() {
+    const had = this.current
+    this.shuffleAll = false
+    this.queue = []
+    if (had) this.history.push(had)
+    this.current = null
+    this.state = 'idle' // not 'playing' while the old stream winds down
+    this.startAt = 0
+    this.interrupt()
+    return had
+  }
+  // Shuffle all: keep a few random songs from the whole library queued, for as long as it is on.
+  setShuffleAll(on) {
+    this.shuffleAll = !!on
+    if (this.shuffleAll) {
+      this.ensureRunning()
+      this.topUp()
+    }
+  }
+  // Resolves once the queue has been filled. A second caller waits for the fill already under way, rather than
+  // seeing an empty queue and giving up.
+  topUp() {
+    if (!this.shuffleAll || this.queue.length >= 3) return Promise.resolve()
+    if (this.fillPromise) return this.fillPromise
+    this.fillPromise = (async () => {
+      try {
+        const jf = this.jf()
+        if (!jf) throw new Error('music is no longer linked')
+        const have = new Set([...this.queue.map((t) => t.id), this.current && this.current.id])
+        const fresh = (await jf.randomSongs(8)).filter((t) => !have.has(t.id))
+        if (this.shuffleAll) for (const t of fresh) this.queue.push({ ...t, addedById: null, addedBy: 'Shuffle' })
+        if (fresh.length) this.ensureRunning()
+      } catch (err) {
+        this.shuffleAll = false
+        this.say("I couldn't pick random songs just now, so shuffle is off. Try again in a moment?")
+        console.error('jellybox shuffle:', err.message)
+      } finally {
+        this.fillPromise = null
+      }
+    })()
+    return this.fillPromise
+  }
   skip() {
     if (!this.current) return null
     const gone = this.current
     this.history.push(gone)
     // The next song is chosen now, so the state never shows a gap while the old stream winds down.
     this.current = this.queue.shift() || null
+    if (!this.current) this.state = 'idle'
     this.startAt = 0
     this.interrupt()
     return gone
@@ -156,6 +205,7 @@ export class Player {
       if (!this.connected) {
         await this.sink.connect()
         this.connected = true
+        if (this.onConnected) this.onConnected() // the bot has just joined the room
       }
     } catch (err) {
       this.running = false
@@ -169,10 +219,12 @@ export class Player {
     try {
       while (!this.stopped) {
         if (!this.current) {
+          if (this.shuffleAll && this.queue.length === 0) await this.topUp()
           this.current = this.queue.shift() || null
           if (!this.current) break
           this.startAt = 0
         }
+        this.topUp() // keeps shuffle's queue from running dry (does nothing when it is off)
         const track = this.current
         if (this.lastTrack !== track) {
           this.lastTrack = track
@@ -202,6 +254,15 @@ export class Player {
           }
           this.say(`I lost the stream to "${track.title}" and couldn't pick it up again, so I'm moving on.`)
           outcome = 'failed'
+        }
+        if (outcome === 'ended') this.failStreak = 0
+        if (outcome === 'failed') this.failStreak++
+        if (this.shuffleAll && this.failStreak >= MAX_FAIL_STREAK) {
+          // shuffle would otherwise pick another song, fail again, and keep at it for ever
+          this.shuffleAll = false
+          this.queue = this.queue.filter((t) => t.addedBy !== 'Shuffle')
+          this.failStreak = 0
+          this.say("A few songs in a row wouldn't play, so I've turned shuffle off. Is Jellyfin okay?")
         }
         if (outcome === 'ended' || outcome === 'failed') {
           if (this.current === track) {

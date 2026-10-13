@@ -10,8 +10,8 @@ import { BOT_NAME, describe, fmtTime, say } from './voice.js'
 export { BOT_NAME }
 export { JellyfinError }
 
-const COMMANDS = new Set(['play', 'search', 'queue', 'skip', 'nowplaying', 'np', 'pause', 'resume', 'previous', 'volume', 'seek', 'clear', 'remove', 'help'])
-const ADMIN_COMMANDS = new Set(['pause', 'resume', 'previous', 'volume', 'seek', 'clear', 'remove'])
+const COMMANDS = new Set(['play', 'search', 'queue', 'skip', 'nowplaying', 'np', 'pause', 'resume', 'previous', 'volume', 'seek', 'clear', 'remove', 'stop', 'shuffle', 'help'])
+const ADMIN_COMMANDS = new Set(['shuffle', 'stop', 'pause', 'resume', 'previous', 'volume', 'seek', 'clear', 'remove'])
 const QUEUE_CAP = () => Number(process.env.JELLYBOX_QUEUE_CAP) || 10
 const QUEUE_MAX = 100
 const RATE_WINDOW_MS = Number(process.env.JELLYBOX_RATE_WINDOW_MS) || 10000
@@ -112,6 +112,7 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
         say: (text) => postBotMessage(type, spaceId, text)
       })
       e = { player, serverId, type, spaceId, emptySince: null }
+      player.onConnected = () => postBotMessage(type, spaceId, say.joined())
       player.onFailed = () => {
         if (players.get(room) === e) players.delete(room)
       }
@@ -145,7 +146,7 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
     const link = getLink(serverId)
     if (!link) return { available: false }
     const e = players.get(`s${serverId}-${type}-${spaceId}`)
-    if (!e) return { available: true, active: false, state: 'idle', volume: 100, nowPlaying: null, queue: [] }
+    if (!e) return { available: true, active: false, state: 'idle', volume: 100, shuffleAll: false, nowPlaying: null, queue: [] }
     return { available: true, active: true, ...e.player.snapshot() }
   }
 
@@ -261,6 +262,23 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
           if (!player || !player.current) return say.nothingToSkip()
           return say.skipped(describe(player.skip()))
         }
+        case 'shuffle': {
+          const off = /^(off|stop)$/i.test(arg)
+          const p = off ? player : playerFor(ctx.serverId, ctx.type, ctx.spaceId)
+          if (off) {
+            if (!p || !p.shuffleAll) return say.shuffleOff()
+            p.setShuffleAll(false)
+            return say.shuffleOff()
+          }
+          if (p.shuffleAll) return say.shuffleAlready()
+          p.setShuffleAll(true)
+          return say.shuffleOn()
+        }
+        case 'stop': {
+          if (!player || (!player.current && player.queue.length === 0)) return say.stopped(null)
+          const was = player.stopPlayback()
+          return say.stopped(was ? describe(was) : 'the queue')
+        }
         case 'pause':
           if (!player || !player.current) return idleReply()
           return player.pause() ? say.paused() : say.alreadyPaused()
@@ -321,6 +339,10 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
         return { ok: false, status: 502, error: 'Could not reach the music library' }
       }
     }
+    if (action === 'shuffle' && !e) {
+      playerFor(serverId, type, spaceId).setShuffleAll(value !== false)
+      return { ok: true }
+    }
     if (!e) return { ok: false, status: 409, error: 'Nothing is playing' }
     const p = e.player
     switch (action) {
@@ -328,6 +350,10 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
       case 'resume': p.resume(); break
       case 'skip': p.skip(); break
       case 'previous': p.previous(); break
+      case 'stop': p.stopPlayback(); break
+      case 'shuffle':
+        p.setShuffleAll(value !== false)
+        break
       case 'clear': p.clear(); break
       case 'volume':
         if (typeof value !== 'number' || !Number.isFinite(value)) return { ok: false, status: 400, error: 'volume must be a number' }
@@ -351,10 +377,18 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
     if (!found.jf) return null
     return found.jf.search(q, 12)
   }
+  async function browse(serverId, kind, opts) {
+    const found = jfFor(serverId)
+    return found.jf ? found.jf.browse(kind, opts) : null
+  }
+  async function children(serverId, kind, id) {
+    const found = jfFor(serverId)
+    return found.jf ? found.jf.children(kind, id) : null
+  }
   async function cover(serverId, itemId) {
     const found = jfFor(serverId)
     return found.jf ? found.jf.cover(itemId) : null
   }
 
-  return { getLink, link, test, unlink, state, handleCommand, control, search, cover, sweep, activeSpaces, stopForServer, stopForSpace, activeRooms: () => players.size }
+  return { getLink, link, test, unlink, state, handleCommand, control, search, browse, children, cover, sweep, activeSpaces, stopForServer, stopForSpace, activeRooms: () => players.size }
 }

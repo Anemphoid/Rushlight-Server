@@ -102,4 +102,9 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   `purgeExpiredHistory` runs at start and every 24 h and deletes messages older than the window in PERSISTENT spaces
   only (calendar months). Ephemeral spaces have their own wipe. When images arrive they must be deleted with
   their messages in the same job. The log may count what was removed but must never print message content or names.
+- Jellybox commands: everyone gets /play /search /queue /nowplaying (/np) /skip /help; admins and the owner also get /stop (ends the
+  song, empties the queue and shuffle, the bot stays), /shuffle (random songs from the whole library, topped up as the queue runs low,
+  gives up after three songs in a row that will not play), /pause /resume /previous /volume /seek /clear /remove. The bot posts a short
+  note of the everyone-commands when it joins a room. Library browsing (`GET .../music/browse`) is admin-only like search. Add new
+  commands to `COMMANDS` and, if they change the room's music, to `ADMIN_COMMANDS`, and to the help text in `voice.js`.
 
