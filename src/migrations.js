@@ -227,6 +227,23 @@ export const migrations = [
       // Only adds a column, so every existing message is unchanged (0).
       db.exec('ALTER TABLE messages ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0')
     }
+  },
+  {
+    id: 11,
+    name: 'a server can link a Jellyfin library for the Jellybox music bot',
+    up(db) {
+      // One link per server. token_enc is the Jellyfin access token, encrypted with a key derived from
+      // the server's own secret; the address is kept as typed (after checks). Only adds a table.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS server_music (
+          server_id INTEGER PRIMARY KEY,
+          address TEXT NOT NULL,
+          token_enc TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          linked_at INTEGER NOT NULL
+        )
+      `)
+    }
   }
 ]
 
