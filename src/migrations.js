@@ -254,6 +254,38 @@ export const migrations = [
       // the first cleanup only removes messages older than a year, and the owner can pick 3, 6, 9 or 12.
       db.exec('ALTER TABLE servers ADD COLUMN retention_months INTEGER NOT NULL DEFAULT 12')
     }
+  },
+  {
+    id: 13,
+    name: 'chat messages can carry one picture',
+    up(db) {
+      // The picture is stored as an opaque file by id (already stripped of metadata), apart from the
+      // message so listing messages never loads image bytes. The triggers tie its life to the message:
+      // whatever deletes the message (the nightly history cleanup, an ephemeral room emptying, a room,
+      // channel or server being deleted) takes the picture with it, and redacting a message (its author
+      // deleted their account) removes it too. Only adds a table and two triggers.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS message_images (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_id INTEGER NOT NULL UNIQUE,
+          mime TEXT NOT NULL,
+          width INTEGER NOT NULL,
+          height INTEGER NOT NULL,
+          size INTEGER NOT NULL,
+          data BLOB NOT NULL,
+          created_at INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS message_images_on_delete AFTER DELETE ON messages
+        BEGIN
+          DELETE FROM message_images WHERE message_id = OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS message_images_on_redact AFTER UPDATE OF redacted ON messages
+        WHEN NEW.redacted = 1
+        BEGIN
+          DELETE FROM message_images WHERE message_id = NEW.id;
+        END;
+      `)
+    }
   }
 ]
 

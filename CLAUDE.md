@@ -100,11 +100,16 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   publishing through `@livekit/rtc-node` is only checked on a real install. Needs ffmpeg on the machine.
 - History retention: `servers.retention_months` (3, 6, 9 or 12, default 12; migration 12). Only the owner changes it.
   `purgeExpiredHistory` runs at start and every 24 h and deletes messages older than the window in PERSISTENT spaces
-  only (calendar months). Ephemeral spaces have their own wipe. When images arrive they must be deleted with
-  their messages in the same job. The log may count what was removed but must never print message content or names.
+  only (calendar months). Ephemeral spaces have their own wipe. Pictures are deleted with their messages by triggers
+  (migration 13), so any DELETE of a message takes its picture. The log may count what was removed but must never print message content or names.
 - Jellybox commands: everyone gets /play /search /queue /nowplaying (/np) /skip /help; admins and the owner also get /stop (ends the
   song, empties the queue and shuffle, the bot stays), /shuffle (random songs from the whole library, topped up as the queue runs low,
   gives up after three songs in a row that will not play), /pause /resume /previous /volume /seek /clear /remove. The bot posts a short
   note of the everyone-commands when it joins a room. Library browsing (`GET .../music/browse`) is admin-only like search. Add new
   commands to `COMMANDS` and, if they change the room's music, to `ADMIN_COMMANDS`, and to the help text in `voice.js`.
 
+- Pictures in chat (migration 13, `message_images`, `src/images.js`): raw-body upload to `/api/channels|rooms/:id/images`, fetched from
+  `GET /api/images/:id` (members only, 404 otherwise, no guests). `inspectImage` checks the real signature and size and strips
+  EXIF/XMP/text/comments/trailing data by editing bytes, never decoding. Two triggers (after delete, after redact) tie a picture's life to
+  its message, so keep deleting messages with plain DELETE/UPDATE and the picture follows; never add a code path that removes a message
+  without them. List queries join the picture's id/size but never its bytes. Limits: IMAGE_MAX_BYTES, IMAGE_LIMIT, IMAGE_DAILY_BYTES.
