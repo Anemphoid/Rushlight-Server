@@ -6,6 +6,7 @@ import { randomBytes } from 'node:crypto'
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { db } from './db.js'
 import { generateCode } from './wordlist.js'
+import { createMusic, BOT_NAME, JellyfinError, isItemId } from './music/index.js'
 import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches } from './recoverykey.js'
 import {
   hashPassword,
@@ -417,6 +418,12 @@ function presenceForServer(serverId, onlyKey = null) {
     const rows = db.prepare(`SELECT id, avatar_updated_at FROM accounts WHERE id IN (${placeholders})`).all(...allIds)
     for (const r of rows) avatarUpdatedAt.set(r.id, r.avatar_updated_at)
   }
+  // Jellybox shows up like another person in the room it is playing in, flagged as a bot.
+  for (const { type, spaceId } of music.activeSpaces(serverId)) {
+    const key = spaceKey(type, spaceId)
+    if (onlyKey && key !== onlyKey) continue
+    if (!out[key]) out[key] = []
+  }
   for (const [key, space] of included) {
     out[key] = [...space.entries].map(([id, e]) => ({
       id,
@@ -425,6 +432,11 @@ function presenceForServer(serverId, onlyKey = null) {
       avatarUpdatedAt: avatarUpdatedAt.get(id) || null,
       ...(e.guest ? { guest: true } : {})
     }))
+  }
+  for (const { type, spaceId } of music.activeSpaces(serverId)) {
+    const key = spaceKey(type, spaceId)
+    if (onlyKey && key !== onlyKey) continue
+    out[key].push({ id: 'jellybox', name: BOT_NAME, avatarColor: null, avatarUpdatedAt: null, bot: true })
   }
   return out
 }
@@ -759,6 +771,9 @@ app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
   const password = body.password
   if (!username) {
     return res.status(400).json({ error: 'Username needs 3 to 32 printable characters' })
+  }
+  if (username.toLowerCase() === BOT_NAME.toLowerCase()) {
+    return res.status(400).json({ error: 'That name is reserved for the music bot' })
   }
   const problem = passwordProblem(password)
   if (problem) return res.status(400).json({ error: problem })
@@ -1149,9 +1164,11 @@ app.delete('/api/servers/:id', accountSecretsLimiter, requireAuth, requireServer
     db.prepare('DELETE FROM server_bans WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM access_ends WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_members WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM server_music WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM servers WHERE id = ?').run(id)
   })
   tx()
+  await music.stopForServer(Number(id))
   forgetServer(Number(id), voiceRooms)
   res.json({ deleted: true })
 }))
@@ -1316,6 +1333,8 @@ app.delete('/api/servers/:id/channels/:channelId', requireAuth, requireServerAdm
   })
   const removedRoomIds = tx()
   const sid = Number(req.params.id)
+  await music.stopForSpace('channel', channel.id)
+  for (const rid of removedRoomIds) await music.stopForSpace('room', rid)
   bestEffort(roomService.deleteRoom(`s${sid}-channel-${channel.id}`))
   for (const rid of removedRoomIds) bestEffort(roomService.deleteRoom(`s${sid}-room-${rid}`))
   await revokeCodesScopedTo({ serverId: sid, channelId: channel.id, roomIds: removedRoomIds })
@@ -1407,6 +1426,7 @@ app.delete(
 
     db.prepare('DELETE FROM messages WHERE room_id = ?').run(room.id)
     db.prepare('DELETE FROM rooms WHERE id = ?').run(room.id)
+    await music.stopForSpace('room', room.id)
     bestEffort(roomService.deleteRoom(`s${Number(req.params.id)}-room-${room.id}`))
     await revokeCodesScopedTo({ serverId: Number(req.params.id), roomIds: [room.id] })
     res.json({ deleted: true })
@@ -1987,7 +2007,9 @@ function serializeMessage(m) {
     avatarUpdatedAt: m.current_avatar_updated_at || null, // live — reflects the author's avatar *now*
     text: m.text,
     createdAt: m.created_at,
-    redacted: false
+    redacted: false,
+    // The music bot's messages have no account behind them.
+    bot: m.author_account_id == null
   }
 }
 
@@ -2029,6 +2051,30 @@ function listMessages(kind, req, res) {
   res.json({ messages: messages.map(serializeMessage) })
 }
 
+function insertMessage(kind, spaceId, accountId, name, avatarColor, text) {
+  const info = db
+    .prepare(
+      `INSERT INTO messages (channel_id, room_id, author_account_id, author_name, author_avatar_color, text, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(kind === 'channel' ? spaceId : null, kind === 'room' ? spaceId : null, accountId, name, avatarColor, text, Date.now())
+  return db
+    .prepare(
+      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at
+       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id WHERE m.id = ?`
+    )
+    .get(info.lastInsertRowid)
+}
+
+const BOT_COLOR = '#d9a441'
+function postBotMessage(kind, spaceId, text) {
+  try {
+    insertMessage(kind, Number(spaceId), null, BOT_NAME, BOT_COLOR, text)
+  } catch (err) {
+    console.error('jellybox could not post:', err.message)
+  }
+}
+
 function postMessage(kind, req, res) {
   const { text, avatarColor } = req.body || {}
   if (typeof text !== 'string' || !text.trim()) {
@@ -2036,28 +2082,30 @@ function postMessage(kind, req, res) {
   }
   if (text.length > 4000) return res.status(400).json({ error: 'Message is too long' })
 
-  const spaceId = kind === 'channel' ? req.params.channelId : req.params.roomId
-  const info = db
-    .prepare(
-      `INSERT INTO messages (channel_id, room_id, author_account_id, author_name, author_avatar_color, text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      kind === 'channel' ? spaceId : null,
-      kind === 'room' ? spaceId : null,
-      req.account.sub,
-      req.account.username,
-      cleanColor(avatarColor),
-      text.trim(),
-      Date.now()
-    )
-  const message = db
-    .prepare(
-      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at
-       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id WHERE m.id = ?`
-    )
-    .get(info.lastInsertRowid)
+  const spaceId = Number(kind === 'channel' ? req.params.channelId : req.params.roomId)
+  const message = insertMessage(kind, spaceId, req.account.sub, req.account.username, cleanColor(avatarColor), text.trim())
   res.json(serializeMessage(message))
+
+  // Slash commands for the music bot: the person's own message stays as typed, and Jellybox
+  // answers in the same chat a moment later.
+  if (text.trim().startsWith('/')) {
+    const space = lookupSpace(kind, spaceId)
+    const membership = space ? getMembership(space.server_id, req.account.sub) : null
+    if (space && membership) {
+      const ctx = {
+        serverId: space.server_id,
+        type: kind,
+        spaceId,
+        spaceMode: space.mode,
+        account: { id: req.account.sub, name: req.account.username },
+        isAdmin: !!membership.is_admin || ownerIdOf(space.server_id) === req.account.sub
+      }
+      music
+        .handleCommand(ctx, text)
+        .then((reply) => reply && postBotMessage(kind, spaceId, reply))
+        .catch((err) => console.error('jellybox command:', err.message))
+    }
+  }
 }
 
 app.get('/api/channels/:channelId/messages', requireAuth, requireSpaceMember('channel', 'channelId'), (req, res) =>
@@ -2072,6 +2120,133 @@ app.get('/api/rooms/:roomId/messages', requireAuth, requireSpaceMember('room', '
 app.post('/api/rooms/:roomId/messages', requireAuth, requireSpaceMember('room', 'roomId'), (req, res) =>
   postMessage('room', req, res)
 )
+
+// --- Jellybox (music bot) ------------------------------------------------
+// The owner links one Jellyfin library per server; see src/music/. Everything here is about who may
+// do what: only the owner links, tests or unlinks; any member can see whether music is set up and
+// use the chat commands; only admins and the owner press the panel's buttons or search from it.
+
+const music = createMusic({
+  db,
+  livekit: { url: LIVEKIT_URL, apiKey: LIVEKIT_API_KEY, apiSecret: LIVEKIT_API_SECRET },
+  postBotMessage: (type, spaceId, text) => postBotMessage(type, spaceId, text),
+  isOccupied,
+  hasPresence: (type, spaceId, accountId) => {
+    const space = presence.get(spaceKey(type, spaceId))
+    if (!space) return false
+    pruneEntries(space, Date.now())
+    return space.entries.has(accountId)
+  }
+})
+
+const musicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.MUSIC_LIMIT) || 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Slow down a little and try again.' }
+})
+const musicLinkLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.MUSIC_LINK_LIMIT) || 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Try again in a few minutes.' }
+})
+
+function musicProblem(res, err) {
+  if (err instanceof JellyfinError) {
+    // Our own wording only: nothing from Jellyfin's answer is passed along, and the token never appears.
+    return res.status(err.kind === 'address' || err.kind === 'auth' ? 400 : 502).json({ error: err.message })
+  }
+  throw err
+}
+
+app.get('/api/servers/:id/music', requireAuth, requireServerMember, (req, res) => {
+  const link = music.getLink(Number(req.params.id))
+  const isOwner = ownerIdOf(req.params.id) === req.account.sub
+  // The address and kind are the owner's business; everyone else only learns whether music is set up.
+  res.json(link ? { linked: true, ...(isOwner ? { address: link.address, kind: link.kind } : {}) } : { linked: false })
+})
+
+app.put('/api/servers/:id/music', musicLinkLimiter, requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  try {
+    const out = await music.link(Number(req.params.id), req.body || {})
+    res.json({ linked: true, address: out.address, kind: out.kind, name: out.name })
+  } catch (err) {
+    musicProblem(res, err)
+  }
+}))
+
+app.post('/api/servers/:id/music/test', musicLinkLimiter, requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  try {
+    const info = await music.test(Number(req.params.id))
+    res.json({ ok: true, name: info.name })
+  } catch (err) {
+    musicProblem(res, err)
+  }
+}))
+
+app.delete('/api/servers/:id/music', requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  await music.unlink(Number(req.params.id))
+  res.json({ linked: false })
+}))
+
+app.get('/api/servers/:id/music/search', musicLimiter, requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : ''
+  if (!q || q.length > 100) return res.status(400).json({ error: 'Type something to search for' })
+  try {
+    const results = await music.search(Number(req.params.id), q)
+    if (results === null) return res.status(409).json({ error: 'Music is not set up' })
+    res.json({ results })
+  } catch (err) {
+    musicProblem(res, err)
+  }
+}))
+
+app.get('/api/servers/:id/music/cover/:itemId', musicLimiter, requireAuth, requireServerMember, asyncHandler(async (req, res) => {
+  if (!isItemId(req.params.itemId)) return res.status(400).json({ error: 'Bad item' })
+  let img = null
+  try {
+    img = await music.cover(Number(req.params.id), req.params.itemId)
+  } catch {
+    // no cover is fine
+  }
+  if (!img) return res.status(404).json({ error: 'No cover' })
+  res.set({ 'content-type': img.type, 'cache-control': 'private, max-age=3600', 'x-content-type-options': 'nosniff' })
+  res.send(img.data)
+}))
+
+// Space-level routes: the panel for a voice room.
+function musicSpace(req, res, next) {
+  const type = req.params.type
+  const spaceId = toId(req.params.spaceId)
+  if ((type !== 'channel' && type !== 'room') || !spaceId) return res.status(400).json({ error: 'type must be channel or room' })
+  const space = lookupSpace(type, spaceId)
+  if (!space) return res.status(404).json({ error: 'Not found' })
+  const membership = getMembership(space.server_id, req.account.sub)
+  if (!membership) return notAMember(res, space.server_id, req.account.sub)
+  req.musicSpace = { type, spaceId, serverId: space.server_id, mode: space.mode }
+  req.isMusicAdmin = !!membership.is_admin || ownerIdOf(space.server_id) === req.account.sub
+  next()
+}
+
+app.get('/api/music/:type/:spaceId/state', requireAuth, musicSpace, (req, res) => {
+  const { type, spaceId, serverId } = req.musicSpace
+  res.json({ ...music.state(serverId, type, spaceId), canControl: req.isMusicAdmin })
+})
+
+app.post('/api/music/:type/:spaceId/control', musicLimiter, requireAuth, musicSpace, asyncHandler(async (req, res) => {
+  if (!req.isMusicAdmin) return res.status(403).json({ error: 'Admin only' })
+  const { type, spaceId, serverId, mode } = req.musicSpace
+  if (mode === 'text') return res.status(400).json({ error: 'That space has no voice' })
+  const space = presence.get(spaceKey(type, spaceId))
+  if (!space || !space.entries.has(req.account.sub)) return res.status(409).json({ error: 'Join the voice room first' })
+  const { action, itemId, kind, value } = req.body || {}
+  const out = await music.control({ serverId, type, spaceId, account: { id: req.account.sub, name: req.account.username }, action, itemId, kind, value })
+  if (!out.ok) return res.status(out.status).json({ error: out.error })
+  res.json({ ok: true, ...music.state(serverId, type, spaceId) })
+}))
 
 // --- Presence routes ---
 
@@ -2281,6 +2456,7 @@ setInterval(purgeOldAccessEnds, 60 * 60 * 1000).unref()
 setInterval(() => {
   sweepPresence()
   sweepProposals()
+  music.sweep()
   // async (it may call out to LiveKit) — fire and forget, but never let a
   // rejection take the whole process down
   sweepMemberships().catch((err) => console.error('sweepMemberships:', err))

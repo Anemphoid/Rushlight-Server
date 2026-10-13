@@ -368,6 +368,44 @@ people they share a server with.
 Presence and message responses carry each account's current `avatarUpdatedAt`, so
 changing your picture updates it everywhere, old messages included.
 
+## Music (Jellybox)
+
+The owner can link one Jellyfin library per server. A bot called Jellybox then joins a voice room
+as its own participant when someone there types `/play`, and plays songs from that library.
+
+**Needs `ffmpeg` on the server machine** (`apt install ffmpeg`). Without it a `/play` answers that it
+tripped over the song; nothing else is affected. The bot publishes audio with `@livekit/rtc-node`,
+a native module installed by `npm ci`; if it cannot load on your machine, the rest of the server
+still runs and the bot says it couldn't get into the room.
+
+- **Linking** (owner only; Admin Tools, Music): `PUT /api/servers/:id/music` with the Jellyfin
+  address and either `apiKey`, or `username` and `password` (exchanged once for an access token; the
+  password is not kept). `POST .../music/test` checks the saved link, `DELETE .../music` unlinks and
+  sends the bot away. Nothing is saved unless the details work. Only the token is stored, sealed with
+  AES-256-GCM under a key derived from `JWT_SECRET` (or `MUSIC_SECRET` if you set one). It is never
+  logged and never sent to a client; other members only learn whether music is set up. If you change
+  the secret, the link can no longer be read and the owner links again.
+- **Where it connects:** only the one address the owner entered, only Jellyfin's search, item, cover
+  and audio endpoints, redirects only within that origin (max 3). Cloud-metadata names and link-local
+  addresses (`169.254.x.x`, `fe80::`) are refused; LAN and local addresses are allowed on purpose.
+  The address is checked when linking and testing; it is not re-resolved on every song.
+- **Commands** typed in the chat of a voice room, by someone who is in that room: `/play` (a song,
+  album or artist, or a number from `/search`), `/search`, `/queue`, `/nowplaying` (`/np`), `/skip`
+  and `/help` for everyone; `/pause`, `/resume`, `/previous`, `/volume`, `/seek`, `/clear` and
+  `/remove` for admins and the owner. The person's message stays as typed and Jellybox answers in the
+  same chat (messages come back with `bot: true`). One person may have `JELLYBOX_QUEUE_CAP`
+  songs (default 10) in the lineup, counting the one playing; admins are exempt. Commands are
+  rate-limited per person (`JELLYBOX_RATE_MAX` per `JELLYBOX_RATE_WINDOW_MS`, default 6 per 10 s).
+  The name "Jellybox" cannot be registered as a username.
+- **Panel routes:** `GET /api/music/:channel|room/:id/state` (any member; says `available: false`
+  when nothing is linked), `POST .../control` (admins and the owner, who must be in the room),
+  `GET /api/servers/:id/music/search?q=` (admins) and `.../music/cover/:itemId` (members).
+- **Streaming:** each song is fetched from Jellyfin, decoded by ffmpeg and sent to the room as 20 ms
+  frames. The request timeout (10 s, `JELLYBOX_REQUEST_TIMEOUT_MS`) only covers waiting for Jellyfin to start
+  answering, never the song itself. If a stream breaks part way it is picked up again where it stopped, up to
+  five times, and then Jellybox says so and moves on. Nothing is downloaded or stored. One bot per room; it leaves 5 seconds after the room empties
+  (`JELLYBOX_LEAVE_MS`), when the owner unlinks, or when the room, channel or server is deleted.
+  Players live in memory, so a restart empties the queues.
 ## How long chat history is kept
 
 Persistent chat is kept for a number of months, then the oldest messages are deleted. The window is per

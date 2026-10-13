@@ -229,6 +229,23 @@ export const migrations = [
     }
   },
   {
+    id: 11,
+    name: 'a server can link a Jellyfin library for the Jellybox music bot',
+    up(db) {
+      // One link per server. token_enc is the Jellyfin access token, encrypted with a key derived from
+      // the server's own secret; the address is kept as typed (after checks). Only adds a table.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS server_music (
+          server_id INTEGER PRIMARY KEY,
+          address TEXT NOT NULL,
+          token_enc TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          linked_at INTEGER NOT NULL
+        )
+      `)
+    }
+  },
+  {
     // Ids are not reused: 11 is the Jellybox music link (its own release), so this one is 12.
     id: 12,
     name: 'persistent chat history is kept for a number of months per server',
