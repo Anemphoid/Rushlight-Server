@@ -340,6 +340,19 @@ export const migrations = [
         ALTER TABLE join_codes ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0;
       `)
     }
+  },
+  {
+    id: 16,
+    name: 'a per-room switch for Jellybox in encrypted servers',
+    up(db) {
+      // Jellybox plays audio from the server, which cannot be end-to-end encrypted, so in an encrypted server it only
+      // joins a room an admin has allowed it in, and that room's voice then runs without the end-to-end layer (chat
+      // stays encrypted). Off (0) is the default for every space. Only adds columns; ignored in servers without encryption.
+      db.exec(`
+        ALTER TABLE channels ADD COLUMN jellybox_open INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE rooms ADD COLUMN jellybox_open INTEGER NOT NULL DEFAULT 0;
+      `)
+    }
   }
 ]
 

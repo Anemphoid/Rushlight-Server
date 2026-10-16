@@ -726,9 +726,10 @@ function serializeTree(serverId, scope = null) {
     name: ch.name,
     mode: ch.mode,
     persistent: !!ch.persistent,
+    jellyboxOpen: !!ch.jellybox_open,
     rooms: rooms
       .filter((r) => r.channel_id === ch.id)
-      .map((r) => ({ id: r.id, name: r.name, mode: r.mode, persistent: !!r.persistent }))
+      .map((r) => ({ id: r.id, name: r.name, mode: r.mode, persistent: !!r.persistent, jellyboxOpen: !!r.jellybox_open }))
   }))
   if (!scope) return tree
   if (scope.type === 'channel') return tree.filter((ch) => ch.id === scope.id)
@@ -1982,10 +1983,10 @@ app.post('/api/join', joinLimiter, (req, res) => {
 
 function lookupSpace(type, id) {
   return type === 'channel'
-    ? db.prepare('SELECT server_id, mode, id AS channel_id FROM channels WHERE id = ?').get(id)
+    ? db.prepare('SELECT server_id, mode, id AS channel_id, jellybox_open FROM channels WHERE id = ?').get(id)
     : db
         .prepare(
-          `SELECT channels.server_id AS server_id, rooms.mode AS mode, rooms.channel_id AS channel_id FROM rooms
+          `SELECT channels.server_id AS server_id, rooms.mode AS mode, rooms.channel_id AS channel_id, rooms.jellybox_open AS jellybox_open FROM rooms
            JOIN channels ON rooms.channel_id = channels.id WHERE rooms.id = ?`
         )
         .get(id)
@@ -2080,8 +2081,11 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
 
   // An encrypted server's voice is end-to-end encrypted by the clients; the server cannot do that for anyone, so
   // it only hands out a connection to people who can (an up-to-date member app) and tells them the room is encrypted.
+  // A room an admin has allowed Jellybox in is the exception: its voice runs without the end-to-end layer, because
+  // the bot's audio comes from the server. Its chat stays encrypted.
   const voiceState = e2eeState(space.server_id)
-  const encrypted = !!voiceState.e2ee_enabled
+  const jellyboxOpen = !!voiceState.e2ee_enabled && !!space.jellybox_open
+  const encrypted = !!voiceState.e2ee_enabled && !jellyboxOpen
 
   let identity
   let name
@@ -2122,7 +2126,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
     // restart this is rebuilt as guests ask for tokens again.
     ensureGuestSession(req.guest).rooms.add(room)
   }
-  res.json({ token, livekitUrl: LIVEKIT_URL, room, encrypted, epoch: voiceState.e2ee_epoch })
+  res.json({ token, livekitUrl: LIVEKIT_URL, room, encrypted, epoch: voiceState.e2ee_epoch, ...(jellyboxOpen ? { jellyboxOpen: true } : {}) })
 }))
 
 // --- End-to-end encryption: devices and wrapped keys ---------------------
@@ -2439,6 +2443,7 @@ function insertMessage(kind, spaceId, accountId, name, avatarColor, text, encEpo
 }
 
 const BOT_COLOR = '#d9a441'
+const JELLYBOX_CLOSED = "Jellybox isn't allowed in this room. An admin can allow it from the room's Jellybox switch; voice in the room then stops being end-to-end encrypted."
 function postBotMessage(kind, spaceId, text) {
   try {
     insertMessage(kind, Number(spaceId), null, BOT_NAME, BOT_COLOR, text)
@@ -2487,10 +2492,10 @@ function runCommand(kind, spaceId, account, text) {
   const space = lookupSpace(kind, spaceId)
   const membership = space ? getMembership(space.server_id, account.sub) : null
   if (!space || !membership) return
-  if (e2eeState(space.server_id).e2ee_enabled) {
+  if (e2eeState(space.server_id).e2ee_enabled && !space.jellybox_open) {
     // The bot plays audio from the server, which cannot be encrypted end to end, and it would be unheard in a room
-    // whose members encrypt theirs. A per-room switch for this comes later.
-    postBotMessage(kind, spaceId, "Jellybox isn't available in encrypted servers yet.")
+    // whose members encrypt theirs. An admin has to allow it in this room first.
+    postBotMessage(kind, spaceId, JELLYBOX_CLOSED)
     return
   }
   const ctx = {
@@ -2825,13 +2830,44 @@ app.post('/api/music/:type/:spaceId/control', musicLimiter, requireAuth, musicSp
   if (!req.isMusicAdmin) return res.status(403).json({ error: 'Admin only' })
   const { type, spaceId, serverId, mode } = req.musicSpace
   if (mode === 'text') return res.status(400).json({ error: 'That space has no voice' })
-  if (e2eeState(serverId).e2ee_enabled) return res.status(409).json({ error: "Jellybox isn't available in encrypted servers yet.", reason: 'encrypted' })
+  const spaceRow = lookupSpace(type, spaceId)
+  if (e2eeState(serverId).e2ee_enabled && !spaceRow.jellybox_open) return res.status(409).json({ error: JELLYBOX_CLOSED, reason: 'jellybox_closed' })
   const space = presence.get(spaceKey(type, spaceId))
   if (!space || !space.entries.has(req.account.sub)) return res.status(409).json({ error: 'Join the voice room first' })
   const { action, itemId, kind, value } = req.body || {}
   const out = await music.control({ serverId, type, spaceId, account: { id: req.account.sub, name: req.account.username }, action, itemId, kind, value })
   if (!out.ok) return res.status(out.status).json({ error: out.error })
   res.json({ ok: true, ...music.state(serverId, type, spaceId) })
+}))
+
+// An admin allows or stops Jellybox in one room of an encrypted server. Allowing it takes that room's voice out of
+// the end-to-end layer (the bot's audio comes from the server), so everyone in the call is told and their apps
+// reconnect on seeing the change; stopping it puts the encryption back. Chat is encrypted either way.
+app.put('/api/music/:type/:spaceId/allowed', musicLimiter, requireAuth, musicSpace, asyncHandler(async (req, res) => {
+  if (!req.isMusicAdmin) return res.status(403).json({ error: 'Admin only' })
+  const { type, spaceId, serverId, mode } = req.musicSpace
+  if (mode === 'text') return res.status(400).json({ error: 'That space has no voice' })
+  if (!e2eeState(serverId).e2ee_enabled) return res.status(409).json({ error: 'This server is not encrypted, so Jellybox is always allowed', reason: 'not_encrypted' })
+  const open = req.body && req.body.open
+  if (typeof open !== 'boolean') return res.status(400).json({ error: 'open must be true or false' })
+  const table = type === 'channel' ? 'channels' : 'rooms'
+  const before = lookupSpace(type, spaceId)
+  if (!!before.jellybox_open !== open) {
+    db.prepare(`UPDATE ${table} SET jellybox_open = ? WHERE id = ?`).run(open ? 1 : 0, spaceId)
+    if (!open) await music.stopForSpace(type, spaceId)
+    // Everyone in the call hears about it in the room's chat too, where there is one (voice-only rooms show it
+    // from the tree flag in the app).
+    if (mode !== 'voice') {
+      postBotMessage(
+        type,
+        spaceId,
+        open
+          ? `${req.account.username} allowed Jellybox in this room. While it is allowed, voice here isn't end-to-end encrypted, so everyone reconnects. Chat stays private.`
+          : `${req.account.username} turned Jellybox off in this room. Voice here is end-to-end encrypted again, so everyone reconnects.`
+      )
+    }
+  }
+  res.json({ ok: true, jellyboxOpen: open })
 }))
 
 // --- Presence routes ---

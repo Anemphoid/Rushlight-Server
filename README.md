@@ -492,8 +492,13 @@ design is in the Rushlight roadmap. What the server does and does not do:
   key), so the server only guards the door. `POST /api/voice/token` answers `encrypted` and `epoch` for every room. In
   an encrypted server it gives a member's connection only to an app that sends `X-Rushlight-Client` of
   `E2EE_MIN_CLIENT` or newer (426 `client_too_old` otherwise), refuses guests (409 `guest_encrypted`; invites that carry
-  a key come later), and Jellybox is off: `/play` and the other commands answer that it isn't available in encrypted
-  servers yet, and the control route answers 409 `encrypted`. The server and LiveKit only ever see encrypted frames.
+  a key come later), and Jellybox is off by default: `/play` and the other commands answer that it isn't allowed in
+  that room, and the control route answers 409 `jellybox_closed`. An admin can allow it per room with
+  `PUT /api/music/:type/:spaceId/allowed` (`{ "open": true }`): the bot's audio comes from the server, so that room's
+  voice token then answers `encrypted: false` and `jellyboxOpen: true` and the room runs without the end-to-end layer
+  (chat stays encrypted); the tree shows `jellyboxOpen` for every channel and room, the room's chat gets a plain bot
+  notice naming the admin, and switching it off stops the bot and puts the encryption back. Other rooms are unaffected.
+  Otherwise the server and LiveKit only ever see encrypted frames.
 - **Invites carry keys.** In an encrypted server every invite is the visible code plus a secret half the server never
   sees. The creating app seals the keys the joiner needs (the server keys for a whole-server invite, the voice keys of
   one room for a guest invite) under that secret. `POST /api/servers/:id/codes` must carry `e2ee: { package, secret,
