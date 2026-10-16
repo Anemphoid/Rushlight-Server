@@ -10,6 +10,14 @@ import { createMusic, BOT_NAME, JellyfinError, isItemId } from './music/index.js
 import { inspectImage, ALLOWED_IMAGE_MIME } from './images.js'
 import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches } from './recoverykey.js'
 import {
+  MIN_E2EE_CLIENT,
+  MAX_ACTIVE_DEVICES,
+  clientIsRecentEnough,
+  cleanPublicKey,
+  cleanEnvelopeData,
+  parseEncryptedText
+} from './e2ee.js'
+import {
   hashPassword,
   verifyPassword,
   verifyAgainstNobody,
@@ -597,6 +605,7 @@ async function disconnectFromServerVoice(serverId, accountId) {
 // reason remembered for the person ('removed', 'banned' or 'expired').
 async function removeMember(serverId, accountId, reason = 'removed') {
   db.prepare('DELETE FROM server_members WHERE server_id = ? AND account_id = ?').run(serverId, accountId)
+  forgetMemberKeys(serverId, accountId)
   db.prepare(
     `INSERT INTO access_ends (server_id, account_id, reason, ended_at) VALUES (?, ?, ?, ?)
      ON CONFLICT (server_id, account_id) DO UPDATE SET reason = excluded.reason, ended_at = excluded.ended_at`
@@ -975,9 +984,13 @@ app.delete('/api/me', accountSecretsLimiter, requireAuth, asyncHandler(async (re
     const owned = serversOwnedBy(accountId)
     if (owned.length) return owned
     db.prepare(
-      `UPDATE messages SET text = '', author_name = '', author_avatar_color = NULL, author_account_id = NULL, redacted = 1
+      `UPDATE messages SET text = '', enc_epoch = NULL, author_name = '', author_avatar_color = NULL, author_account_id = NULL, redacted = 1
        WHERE author_account_id = ?`
     ).run(accountId)
+    for (const m of memberships) forgetMemberKeys(m.server_id, accountId)
+    db.prepare('DELETE FROM key_envelopes WHERE recipient_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
+    db.prepare('UPDATE key_envelopes SET sender_device_id = NULL WHERE sender_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
+    db.prepare('DELETE FROM device_keys WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM server_members WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM server_bans WHERE account_id = ?').run(accountId)
     db.prepare('UPDATE server_bans SET banned_by = NULL WHERE banned_by = ?').run(accountId)
@@ -1112,6 +1125,7 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
     isAdmin: !!req.membership.is_admin,
     isOwner: server.owner_id === req.account.sub,
     retentionMonths: server.retention_months,
+    e2ee: { enabled: !!server.e2ee_enabled, epoch: server.e2ee_epoch, rekeyNeeded: !!server.rekey_needed, minClient: MIN_E2EE_CLIENT },
     channels: serializeTree(server.id),
     presence: presenceForServer(server.id),
     proposals: proposalsForServer(server.id, req.account.sub)
@@ -1166,6 +1180,7 @@ app.delete('/api/servers/:id', accountSecretsLimiter, requireAuth, requireServer
     db.prepare('DELETE FROM access_ends WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_members WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_music WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM key_envelopes WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM servers WHERE id = ?').run(id)
   })
   tx()
@@ -1993,6 +2008,227 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
   res.json({ token, livekitUrl: LIVEKIT_URL, room })
 }))
 
+// --- End-to-end encryption: devices and wrapped keys ---------------------
+// Step 1 of the encryption work (the design is in the Rushlight roadmap): the server stores device
+// public keys and "envelopes" (a server key wrapped to one device) and hands them back. It never holds a
+// key that opens anything, and nothing here can turn encryption on for a server yet; that comes later,
+// with the wipe of old plain messages. See docs/e2ee.md.
+
+function e2eeState(serverId) {
+  return db.prepare('SELECT e2ee_enabled, e2ee_epoch, rekey_needed FROM servers WHERE id = ?').get(serverId)
+}
+
+// Someone's membership ended, or one of their devices did: whatever key they held must be replaced,
+// and the next admin client that is online does it (POST .../rekey).
+function markRekeyNeeded(serverId) {
+  db.prepare('UPDATE servers SET rekey_needed = 1 WHERE id = ? AND e2ee_enabled = 1').run(serverId)
+}
+
+// The envelopes addressed to a person's devices for this server are no use to anyone once they are gone.
+function forgetMemberKeys(serverId, accountId) {
+  db.prepare(
+    `DELETE FROM key_envelopes WHERE server_id = ?
+       AND recipient_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)`
+  ).run(serverId, accountId)
+  markRekeyNeeded(serverId)
+}
+
+// Encrypted servers need a client that can open what they hold. Answers 426 and returns true if not.
+function refuseOldClient(req, res, serverId) {
+  const state = serverId ? e2eeState(serverId) : null
+  if (!state || !state.e2ee_enabled) return false
+  if (clientIsRecentEnough(req.get('x-rushlight-client'))) return false
+  res.status(426).json({
+    error: 'This server is end-to-end encrypted. Update Rushlight to keep using it.',
+    reason: 'client_too_old',
+    minClient: MIN_E2EE_CLIENT
+  })
+  return true
+}
+
+function activeDevices(accountId) {
+  return db.prepare('SELECT * FROM device_keys WHERE account_id = ? AND revoked_at IS NULL ORDER BY id').all(accountId)
+}
+
+function serializeDevice(d) {
+  return { id: d.id, label: d.label, publicKey: d.public_key, createdAt: d.created_at }
+}
+
+const deviceLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.DEVICE_LIMIT) || 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `account-${req.account ? req.account.sub : 'none'}`,
+  message: { error: 'Too many device changes. Try again later.' }
+})
+
+app.post('/api/devices', requireAuth, deviceLimiter, (req, res) => {
+  const body = req.body || {}
+  const publicKey = cleanPublicKey(body.publicKey)
+  if (!publicKey) return res.status(400).json({ error: 'That is not a valid device key' })
+  const label = body.label === undefined ? 'This computer' : cleanLabel(body.label, 40)
+  if (!label) return res.status(400).json({ error: 'Device name is required (up to 40 characters)' })
+
+  const have = activeDevices(req.account.sub)
+  const same = have.find((d) => d.public_key === publicKey)
+  if (same) return res.json({ ...serializeDevice(same), created: false })
+  if (have.length >= MAX_ACTIVE_DEVICES) {
+    return res.status(409).json({ error: `You can have up to ${MAX_ACTIVE_DEVICES} devices. Remove one first.`, reason: 'device_limit' })
+  }
+  const info = db
+    .prepare('INSERT INTO device_keys (account_id, public_key, label, created_at) VALUES (?, ?, ?, ?)')
+    .run(req.account.sub, publicKey, label, Date.now())
+  const row = db.prepare('SELECT * FROM device_keys WHERE id = ?').get(info.lastInsertRowid)
+  res.json({ ...serializeDevice(row), created: true })
+})
+
+app.get('/api/devices', requireAuth, (req, res) => {
+  res.json({ devices: activeDevices(req.account.sub).map(serializeDevice) })
+})
+
+// Removing a device. A server it belonged to must rekey, since a lost or stolen computer still has the keys.
+app.delete('/api/devices/:id', requireAuth, deviceLimiter, (req, res) => {
+  const device = db
+    .prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL')
+    .get(Number(req.params.id), req.account.sub)
+  if (!device) return res.status(404).json({ error: 'Not found' })
+  db.transaction(() => {
+    db.prepare('UPDATE device_keys SET revoked_at = ? WHERE id = ?').run(Date.now(), device.id)
+    db.prepare('DELETE FROM key_envelopes WHERE recipient_device_id = ?').run(device.id)
+    const memberships = db.prepare('SELECT server_id FROM server_members WHERE account_id = ?').all(req.account.sub)
+    for (const m of memberships) markRekeyNeeded(m.server_id)
+  })()
+  res.json({ removed: true })
+})
+
+// Every current member's devices, which is who a key has to be wrapped to.
+function memberDevices(serverId) {
+  return db
+    .prepare(
+      `SELECT d.id, d.account_id, d.public_key, d.label, d.created_at, a.username
+       FROM device_keys d
+       JOIN server_members sm ON sm.account_id = d.account_id AND sm.server_id = ?
+       JOIN accounts a ON a.id = d.account_id
+       WHERE d.revoked_at IS NULL ORDER BY d.id`
+    )
+    .all(serverId)
+}
+
+app.get('/api/servers/:id/devices', requireAuth, requireServerMember, (req, res) => {
+  const state = e2eeState(req.params.id)
+  res.json({
+    epoch: state.e2ee_epoch,
+    rekeyNeeded: !!state.rekey_needed,
+    devices: memberDevices(req.params.id).map((d) => ({
+      id: d.id,
+      accountId: d.account_id,
+      username: d.username,
+      label: d.label,
+      publicKey: d.public_key,
+      createdAt: d.created_at
+    }))
+  })
+})
+
+const MAX_ENVELOPES_PER_CALL = 500
+
+// Reads the sender's device and the envelope list a client posted. Returns { error } or { device, list }.
+function readEnvelopeBody(req, serverId) {
+  const body = req.body || {}
+  const senderId = Number(body.senderDeviceId)
+  const device = Number.isInteger(senderId)
+    ? db.prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL').get(senderId, req.account.sub)
+    : null
+  if (!device) return { error: 'senderDeviceId must be one of your devices' }
+  if (!Array.isArray(body.envelopes) || body.envelopes.length === 0 || body.envelopes.length > MAX_ENVELOPES_PER_CALL) {
+    return { error: `envelopes must be a list of 1 to ${MAX_ENVELOPES_PER_CALL}` }
+  }
+  const allowed = new Map(memberDevices(serverId).map((d) => [d.id, d]))
+  const list = []
+  const seen = new Set()
+  for (const e of body.envelopes) {
+    const recipient = e && Number.isInteger(e.recipientDeviceId) ? e.recipientDeviceId : null
+    const data = e ? cleanEnvelopeData(e.data) : null
+    if (!recipient || !data) return { error: 'Each envelope needs a recipientDeviceId and its data' }
+    if (!allowed.has(recipient)) return { error: 'An envelope is for a device that does not belong to a member of this server' }
+    if (seen.has(recipient)) return { error: 'Two envelopes are for the same device' }
+    seen.add(recipient)
+    list.push({ recipient, data })
+  }
+  return { device, list, allowed }
+}
+
+// Wrapped keys for a device of mine, every epoch it has one for.
+app.get('/api/servers/:id/key-envelopes', requireAuth, requireServerMember, (req, res) => {
+  const deviceId = Number(req.query.deviceId)
+  const device = Number.isInteger(deviceId)
+    ? db.prepare('SELECT id FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL').get(deviceId, req.account.sub)
+    : null
+  if (!device) return res.status(400).json({ error: 'deviceId must be one of your devices' })
+  const state = e2eeState(req.params.id)
+  const envelopes = db
+    .prepare(
+      `SELECT epoch, sender_device_id, data, created_at FROM key_envelopes
+       WHERE server_id = ? AND recipient_device_id = ? ORDER BY epoch`
+    )
+    .all(req.params.id, device.id)
+    .map((e) => ({ epoch: e.epoch, senderDeviceId: e.sender_device_id, data: e.data, createdAt: e.created_at }))
+  res.json({ epoch: state.e2ee_epoch, rekeyNeeded: !!state.rekey_needed, envelopes })
+})
+
+// Any member can hand an existing epoch's key to other members' devices (a new member, a new computer).
+// It only ever adds: an envelope already there is left as it is, so nobody can swap one for another.
+app.post('/api/servers/:id/key-envelopes', requireAuth, requireServerMember, (req, res) => {
+  const state = e2eeState(req.params.id)
+  if (!state.e2ee_enabled) return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+  const epoch = req.body && req.body.epoch
+  if (!Number.isInteger(epoch) || epoch < 1 || epoch > state.e2ee_epoch) {
+    return res.status(400).json({ error: 'epoch is not one this server has' })
+  }
+  const read = readEnvelopeBody(req, req.params.id)
+  if (read.error) return res.status(400).json({ error: read.error })
+  let added = 0
+  db.transaction(() => {
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO key_envelopes (server_id, epoch, recipient_device_id, sender_device_id, data, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    for (const e of read.list) added += insert.run(req.params.id, epoch, e.recipient, read.device.id, e.data, Date.now()).changes
+  })()
+  res.json({ added, skipped: read.list.length - added })
+})
+
+// A new epoch: one new key, wrapped to every device of every current member, in one step. Admins and the
+// owner only. Used for the first key, and again after anyone is removed or a device is revoked. Refused
+// unless it covers everyone, so a client with an out-of-date list cannot lock a member out.
+app.post('/api/servers/:id/rekey', requireAuth, requireServerAdmin, (req, res) => {
+  const state = e2eeState(req.params.id)
+  if (!state.e2ee_enabled) return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+  const epoch = req.body && req.body.epoch
+  if (!Number.isInteger(epoch)) return res.status(400).json({ error: 'epoch is required' })
+  const read = readEnvelopeBody(req, req.params.id)
+  if (read.error) return res.status(400).json({ error: read.error })
+
+  const outcome = db.transaction(() => {
+    const now = e2eeState(req.params.id)
+    if (epoch !== now.e2ee_epoch + 1) return { status: 409, body: { error: 'The key changed while you were working. Try again.', reason: 'epoch_changed', epoch: now.e2ee_epoch } }
+    const covered = new Set(read.list.map((e) => e.recipient))
+    const missing = [...read.allowed.keys()].filter((id) => !covered.has(id))
+    if (missing.length) {
+      return { status: 409, body: { error: 'The new key must be wrapped to every member device', reason: 'rekey_incomplete', missing } }
+    }
+    const insert = db.prepare(
+      `INSERT INTO key_envelopes (server_id, epoch, recipient_device_id, sender_device_id, data, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    for (const e of read.list) insert.run(req.params.id, epoch, e.recipient, read.device.id, e.data, Date.now())
+    db.prepare('UPDATE servers SET e2ee_epoch = ?, rekey_needed = 0 WHERE id = ?').run(epoch, req.params.id)
+    return { status: 200, body: { epoch } }
+  })()
+  res.status(outcome.status).json(outcome.body)
+})
+
 // --- Messages (persisted; no real-time push yet — that needs presence) ---
 
 function serializeMessage(m) {
@@ -2006,7 +2242,9 @@ function serializeMessage(m) {
     author: m.author_name,
     avatarColor: m.author_avatar_color, // frozen per-message, as it already was
     avatarUpdatedAt: m.current_avatar_updated_at || null, // live — reflects the author's avatar *now*
-    text: m.text,
+    text: m.text, // ciphertext when `encrypted` is true; the client opens it
+    encrypted: m.enc_epoch != null,
+    epoch: m.enc_epoch == null ? null : m.enc_epoch,
     createdAt: m.created_at,
     redacted: false,
     // The music bot's messages have no account behind them.
@@ -2043,6 +2281,7 @@ function requireSpaceMember(kind, param) {
 function listMessages(kind, req, res) {
   const column = kind === 'channel' ? 'channel_id' : 'room_id'
   const spaceId = kind === 'channel' ? req.params.channelId : req.params.roomId
+  if (refuseOldClient(req, res, serverIdForSpace(kind, Number(spaceId)))) return
   const messages = db
     .prepare(
       `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
@@ -2056,13 +2295,13 @@ function listMessages(kind, req, res) {
   res.json({ messages: messages.map(serializeMessage) })
 }
 
-function insertMessage(kind, spaceId, accountId, name, avatarColor, text) {
+function insertMessage(kind, spaceId, accountId, name, avatarColor, text, encEpoch = null) {
   const info = db
     .prepare(
-      `INSERT INTO messages (channel_id, room_id, author_account_id, author_name, author_avatar_color, text, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (channel_id, room_id, author_account_id, author_name, author_avatar_color, text, created_at, enc_epoch)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(kind === 'channel' ? spaceId : null, kind === 'room' ? spaceId : null, accountId, name, avatarColor, text, Date.now())
+    .run(kind === 'channel' ? spaceId : null, kind === 'room' ? spaceId : null, accountId, name, avatarColor, text, Date.now(), encEpoch)
   return db
     .prepare(
       `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
@@ -2087,32 +2326,66 @@ function postMessage(kind, req, res) {
   if (typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ error: 'Message text is required' })
   }
-  if (text.length > 4000) return res.status(400).json({ error: 'Message is too long' })
 
   const spaceId = Number(kind === 'channel' ? req.params.channelId : req.params.roomId)
+  const serverId = serverIdForSpace(kind, spaceId)
+  const e2ee = e2eeState(serverId)
+  if (e2ee && e2ee.e2ee_enabled) {
+    // Encrypted server: the server cannot read the text, so it also cannot act on it. It checks the
+    // shape and the epoch, stores it as sent and never looks for slash commands (those have their own
+    // route below). Plain text is refused rather than stored.
+    if (refuseOldClient(req, res, serverId)) return
+    const sealed = parseEncryptedText(text)
+    if (!sealed) {
+      return res.status(400).json({ error: 'This server is encrypted. Update Rushlight to send messages.', reason: 'encryption_required' })
+    }
+    if (sealed.epoch > e2ee.e2ee_epoch) {
+      return res.status(400).json({ error: 'That message uses a key this server does not have yet', reason: 'unknown_epoch' })
+    }
+    const message = insertMessage(kind, spaceId, req.account.sub, req.account.username, cleanColor(avatarColor), text, sealed.epoch)
+    return res.json(serializeMessage(message))
+  }
+
+  if (text.length > 4000) return res.status(400).json({ error: 'Message is too long' })
   const message = insertMessage(kind, spaceId, req.account.sub, req.account.username, cleanColor(avatarColor), text.trim())
   res.json(serializeMessage(message))
 
   // Slash commands for the music bot: the person's own message stays as typed, and Jellybox
   // answers in the same chat a moment later.
-  if (text.trim().startsWith('/')) {
-    const space = lookupSpace(kind, spaceId)
-    const membership = space ? getMembership(space.server_id, req.account.sub) : null
-    if (space && membership) {
-      const ctx = {
-        serverId: space.server_id,
-        type: kind,
-        spaceId,
-        spaceMode: space.mode,
-        account: { id: req.account.sub, name: req.account.username },
-        isAdmin: !!membership.is_admin || ownerIdOf(space.server_id) === req.account.sub
-      }
-      music
-        .handleCommand(ctx, text)
-        .then((reply) => reply && postBotMessage(kind, spaceId, reply))
-        .catch((err) => console.error('jellybox command:', err.message))
-    }
+  if (text.trim().startsWith('/')) runCommand(kind, spaceId, req.account, text)
+}
+
+// Runs a slash command for the music bot and posts its answer as the bot. Used by the plain chat path
+// above and by the commands route, which is how an encrypted server's clients send them.
+function runCommand(kind, spaceId, account, text) {
+  const space = lookupSpace(kind, spaceId)
+  const membership = space ? getMembership(space.server_id, account.sub) : null
+  if (!space || !membership) return
+  const ctx = {
+    serverId: space.server_id,
+    type: kind,
+    spaceId,
+    spaceMode: space.mode,
+    account: { id: account.sub, name: account.username },
+    isAdmin: !!membership.is_admin || ownerIdOf(space.server_id) === account.sub
   }
+  music
+    .handleCommand(ctx, text)
+    .then((reply) => reply && postBotMessage(kind, spaceId, reply))
+    .catch((err) => console.error('jellybox command:', err.message))
+}
+
+// A command is not a chat message: it is never stored, and the server needs to read it to do anything,
+// so it travels on its own route, unencrypted. The bot's answer is a plain, labelled bot message.
+function postCommand(kind, req, res) {
+  const { text } = req.body || {}
+  if (typeof text !== 'string' || !text.startsWith('/') || text.length > 500) {
+    return res.status(400).json({ error: 'A command starts with / and is up to 500 characters' })
+  }
+  const spaceId = Number(kind === 'channel' ? req.params.channelId : req.params.roomId)
+  if (refuseOldClient(req, res, serverIdForSpace(kind, spaceId))) return
+  res.json({ ok: true })
+  runCommand(kind, spaceId, req.account, text)
 }
 
 // --- Pictures in chat ---
@@ -2133,6 +2406,12 @@ const imageLimiter = rateLimit({
 })
 
 function postImage(kind, req, res) {
+  const imageServerId = serverIdForSpace(kind, Number(kind === 'channel' ? req.params.channelId : req.params.roomId))
+  if (refuseOldClient(req, res, imageServerId)) return
+  if (e2eeState(imageServerId).e2ee_enabled) {
+    // The server cannot check or strip a picture it cannot read; encrypted pictures are a later release.
+    return res.status(400).json({ error: 'Pictures are not available in encrypted servers yet', reason: 'encryption_required' })
+  }
   const buffer = req.body
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     return res.status(400).json({ error: 'Send the picture as the request body (image/jpeg, image/png or image/webp)' })
@@ -2203,6 +2482,12 @@ app.get('/api/channels/:channelId/messages', requireAuth, requireSpaceMember('ch
 )
 app.post('/api/channels/:channelId/messages', requireAuth, requireSpaceMember('channel', 'channelId'), (req, res) =>
   postMessage('channel', req, res)
+)
+app.post('/api/channels/:channelId/commands', requireAuth, requireSpaceMember('channel', 'channelId'), (req, res) =>
+  postCommand('channel', req, res)
+)
+app.post('/api/rooms/:roomId/commands', requireAuth, requireSpaceMember('room', 'roomId'), (req, res) =>
+  postCommand('room', req, res)
 )
 app.get('/api/rooms/:roomId/messages', requireAuth, requireSpaceMember('room', 'roomId'), (req, res) =>
   listMessages('room', req, res)

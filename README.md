@@ -449,6 +449,38 @@ there is none). The bytes are fetched with `GET /api/images/:id`, which needs th
   message, so listing messages never reads picture bytes. Updating an install only adds the table.
 - There is no way yet for an admin to remove a single picture early; it goes with its message.
 
+## End-to-end encryption (groundwork)
+
+This release adds the server side of end-to-end encryption (migration 14). **Nothing turns it on yet**: no
+route sets a server to encrypted, so an update changes nothing for anyone. Switching it on for a server, with
+the wipe of its old plain messages, is a later release, and so is the client that does the encrypting. The
+design is in the Rushlight roadmap. What the server does and does not do:
+
+- **It never holds a key that opens anything.** It stores each device's public key and "envelopes" (a server key
+  wrapped to one device, opaque to the server), checks their shape, and hands them back. It cannot decrypt.
+- **Devices.** `POST /api/devices` `{ publicKey, label }` (a P-256 point, base64url, checked to be on the curve; the
+  same key twice gives the same device; at most 10 per account), `GET /api/devices`, `DELETE /api/devices/:id`.
+  `GET /api/servers/:id/devices` lists every member's devices: who a key has to be wrapped to.
+- **Epochs and envelopes.** A server has a key epoch (`e2ee.epoch` on `GET /api/servers/:id`, 0 until the first
+  key). `POST /api/servers/:id/rekey` (admin or owner) starts the next epoch with an envelope for every device of
+  every current member, or is refused (`rekey_incomplete`, naming who is missing; `epoch_changed` if someone else
+  got there first). `GET /api/servers/:id/key-envelopes?deviceId=` returns the envelopes for one of your devices;
+  `POST` on the same path lets any member hand an existing epoch's key to another member's device. Envelopes are
+  insert-only: one already there is never replaced, so nobody can swap another person's key.
+- **When a new epoch is needed.** A kick, ban, expiry, account deletion or device removal sets `rekeyNeeded`; the
+  next admin client online makes the new epoch, which clears it. The removed person's envelopes are deleted.
+- **Messages.** In an encrypted server the text must be `rl1.<epoch>.<nonce>.<ciphertext>` (base64url, up to 12000
+  characters, an epoch the server has). The server stores it as sent, in `text`, with `enc_epoch` set, and returns
+  `encrypted` and `epoch` on every message. It no longer looks at the text, so slash commands travel on
+  `POST /api/channels/:id/commands` or `/api/rooms/:id/commands` (`{ text: '/play ...' }`), are never stored, and
+  the bot answers with a plain message labelled as the bot's. The bot's messages are not encrypted.
+- **Pictures** are refused in an encrypted server until they can be encrypted too (a later release).
+- **Version gate.** Clients send `X-Rushlight-Client: <version>`. An encrypted server answers 426
+  (`reason: client_too_old`, with `minClient`) to message, picture and command requests from one that is missing,
+  unreadable or older than `E2EE_MIN_CLIENT` (default 0.22.0). `GET /api/servers/:id` stays open, so an old client
+  can say why.
+- A server without encryption is unchanged: plain text, slash commands in chat, no version needed.
+
 ## Not built yet
 
 - LiveKit bundled with the server, so one setup installs both. Today you install
