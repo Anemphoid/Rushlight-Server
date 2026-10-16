@@ -506,6 +506,8 @@ design is in the Rushlight roadmap. What the server does and does not do:
   /api/guest/key-package`. A guest of an encrypted server needs an invite with a package: one made before encryption
   is refused (409 `old_invite`) without being used up, and a guest who came in earlier gets no voice (409
   `guest_encrypted`). A member can still join with an old invite; the keys then come from another member's app.
+  `POST /api/code-check { code }` looks at a code without using it (`guestsOnly` and the same `e2ee` object), so an app
+  can refuse an invite pasted without its secret half, or with a typo in it, before a single-use invite is spent.
   Taking back an invite that carried keys, or removing a guest, sets `rekeyNeeded`. Needs server v0.16.0.
 - A server without encryption is unchanged: plain text, slash commands in chat, no version needed.
 

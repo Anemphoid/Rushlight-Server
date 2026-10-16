@@ -1820,6 +1820,16 @@ function joinKeys(server, record) {
   return { enabled: true, epoch: server.e2ee_epoch, package: record.key_package || null, packageEpoch: record.key_epoch || 0 }
 }
 
+// Looks at a code without using it: what it covers and, for an encrypted server, the sealed keys it carries. The app calls
+// this before joining, so an invite pasted without its secret half (or with a typo in it) is refused before it is used up.
+// It tells nothing the join itself would not, and is limited the same way.
+app.post('/api/code-check', joinLimiter, (req, res) => {
+  const record = usableCode(res, (req.body || {}).code)
+  if (!record) return
+  const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(record.server_id)
+  res.json({ guestsOnly: !!record.scope_type, e2ee: joinKeys(server, record) })
+})
+
 // A guest's app asks again for the package of the invite it came in with, to pick up the keys of a newer epoch
 // (admins' apps add them when a new key is made). Only for a guest whose invite is still good.
 app.get('/api/guest/key-package', requireAuthOrGuest, (req, res) => {
