@@ -77,7 +77,9 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   device public keys and opaque envelopes and never decrypts. Nothing may turn `servers.e2ee_enabled` on until the
   later step that wipes the server's plain messages (a test tries the obvious routes and checks the flag stays 0). In an encrypted server
   `postMessage` stores `rl1.` ciphertext as sent and must never parse slash commands (they use the commands
-  route); pictures are refused; every message/picture/command route calls `refuseOldClient`. Anything that ends a
+  route); a picture there must be sealed (`postSealedImage`, framing in `src/e2ee.js`): the server cannot inspect it, so the
+  type, size and metadata are the client's job, and `image.sealed` is only present on sealed pictures (plain pictures keep
+  their old shape, a test pins it); every message/picture/command route calls `refuseOldClient`. Anything that ends a
   membership or a device must call `forgetMemberKeys`/`markRekeyNeeded`. Envelopes are insert-only. Account
   deletion removes the person's devices and envelopes in its transaction.
 - Presence, open votes and the guest-session map are in memory on purpose; a

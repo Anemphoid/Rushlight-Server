@@ -474,7 +474,16 @@ design is in the Rushlight roadmap. What the server does and does not do:
   `encrypted` and `epoch` on every message. It no longer looks at the text, so slash commands travel on
   `POST /api/channels/:id/commands` or `/api/rooms/:id/commands` (`{ text: '/play ...' }`), are never stored, and
   the bot answers with a plain message labelled as the bot's. The bot's messages are not encrypted.
-- **Pictures** are refused in an encrypted server until they can be encrypted too (a later release).
+- **Pictures.** An encrypted server takes only sealed pictures: `POST .../images` with `Content-Type:
+  application/x-rushlight-sealed` and a body of 4 bytes (length of the message text, big endian), the sealed
+  message text (`rl1...`, which carries the caption, the picture's key, type and size), then the sealed picture
+  (12 byte nonce, ciphertext, 16 byte tag). The server checks only the framing, the epoch, the size
+  (`IMAGE_MAX_BYTES`, the picture part) and the daily limit (`IMAGE_DAILY_BYTES`, by sealed size). It cannot
+  check the type or strip metadata, so the app does that before sealing; it stores the bytes as sent
+  (`mime` is the sealed type, `width` and `height` 0) and returns `image.sealed: true`. `GET /api/images/:id`
+  returns them as `application/octet-stream` to members only. Plain pictures are refused in an encrypted server
+  (`encryption_required`) and sealed ones in a plain server (`e2ee_off`). A sealed picture goes with its message
+  like any other (retention, deleting the space, the author deleting their account). Needs server v0.14.0.
 - **Version gate.** Clients send `X-Rushlight-Client: <version>`. An encrypted server answers 426
   (`reason: client_too_old`, with `minClient`) to message, picture and command requests from one that is missing,
   unreadable or older than `E2EE_MIN_CLIENT` (default 0.22.0). `GET /api/servers/:id` stays open, so an old client
