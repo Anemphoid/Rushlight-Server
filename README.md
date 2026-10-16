@@ -494,6 +494,19 @@ design is in the Rushlight roadmap. What the server does and does not do:
   `E2EE_MIN_CLIENT` or newer (426 `client_too_old` otherwise), refuses guests (409 `guest_encrypted`; invites that carry
   a key come later), and Jellybox is off: `/play` and the other commands answer that it isn't available in encrypted
   servers yet, and the control route answers 409 `encrypted`. The server and LiveKit only ever see encrypted frames.
+- **Invites carry keys.** In an encrypted server every invite is the visible code plus a secret half the server never
+  sees. The creating app seals the keys the joiner needs (the server keys for a whole-server invite, the voice keys of
+  one room for a guest invite) under that secret. `POST /api/servers/:id/codes` must carry `e2ee: { package, secret,
+  epoch }` there (400 `package_required` otherwise; the shapes are checked, the contents cannot be). `package` is the
+  sealed keys; `secret` is the secret half sealed to the server key, so an admin's app can show the full invite and
+  add new epochs. The list (`GET .../codes`, admins) returns each invite's `e2ee`; `PUT .../codes/:codeId/package`
+  `{ package, epoch, version }` lets an admin's app add a newer epoch (compare-and-swap on `version`: 409
+  `package_changed` if another admin did it first). A member who joins (`POST /api/servers/join`) and a guest (`POST
+  /api/join`) are told `e2ee: { enabled, epoch, package, packageEpoch }`; a guest can ask again with `GET
+  /api/guest/key-package`. A guest of an encrypted server needs an invite with a package: one made before encryption
+  is refused (409 `old_invite`) without being used up, and a guest who came in earlier gets no voice (409
+  `guest_encrypted`). A member can still join with an old invite; the keys then come from another member's app.
+  Taking back an invite that carried keys, or removing a guest, sets `rekeyNeeded`. Needs server v0.16.0.
 - A server without encryption is unchanged: plain text, slash commands in chat, no version needed.
 
 ## Not built yet

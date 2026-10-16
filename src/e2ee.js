@@ -82,3 +82,24 @@ export function parseSealedImage(buffer, maxPictureBytes) {
   if (sealed.length > maxPictureBytes + 12 + 16) return null
   return { text, epoch: parsed.epoch, sealed }
 }
+
+// --- Keys carried by join codes ---
+// An invite to an encrypted server is the visible code plus a secret half the server never sees. The creating app
+// seals the keys the joiner needs (the server keys for a whole-server invite, the voice keys of one room for a guest
+// invite) under that secret; the server keeps the sealed package and gives it to whoever presents the code. A second
+// blob, the secret sealed to the server key, lets any admin's app show the full code and add new epochs' keys to the
+// package. The server cannot open either.
+export const MAX_CODE_PACKAGE = 8192
+const CODE_PACKAGE = /^rlp1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22,}$/
+const CODE_SECRET = /^rlc1\.(\d{1,9})\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22,}$/
+
+export function cleanCodePackage(value) {
+  return typeof value === 'string' && value.length <= MAX_CODE_PACKAGE && CODE_PACKAGE.test(value) ? value : null
+}
+
+// Returns { value, epoch } (the server key epoch it is sealed to) or null.
+export function cleanCodeSecret(value) {
+  if (typeof value !== 'string' || value.length > 1024) return null
+  const m = CODE_SECRET.exec(value)
+  return m && Number(m[1]) >= 1 ? { value, epoch: Number(m[1]) } : null
+}

@@ -324,6 +324,22 @@ export const migrations = [
       // ciphertext made with that epoch's key.
       db.exec('ALTER TABLE messages ADD COLUMN enc_epoch INTEGER')
     }
+  },
+  {
+    id: 15,
+    name: 'join codes can carry sealed encryption keys',
+    up(db) {
+      // An invite to an encrypted server carries keys that only the secret half of the code (which the server never
+      // sees) can open. key_package is the sealed keys, key_secret is that secret half sealed to the server key, so
+      // an admin's app can list the full code and add a new epoch's key to the package. The server stores both
+      // blind. key_version lets two admins refresh one package without overwriting each other. Only adds columns.
+      db.exec(`
+        ALTER TABLE join_codes ADD COLUMN key_package TEXT;
+        ALTER TABLE join_codes ADD COLUMN key_secret TEXT;
+        ALTER TABLE join_codes ADD COLUMN key_epoch INTEGER;
+        ALTER TABLE join_codes ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0;
+      `)
+    }
   }
 ]
 
