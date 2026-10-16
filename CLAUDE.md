@@ -73,6 +73,13 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   every account request. Never add a route that resets or reveals another account's
   password or key (a test scans the source for that), and never change the word list
   (it invalidates every issued key).
+- End-to-end encryption (`src/e2ee.js`, migration 14, README "End-to-end encryption (groundwork)"): the server stores
+  device public keys and opaque envelopes and never decrypts. Nothing may turn `servers.e2ee_enabled` on until the
+  later step that wipes the server's plain messages (a test tries the obvious routes and checks the flag stays 0). In an encrypted server
+  `postMessage` stores `rl1.` ciphertext as sent and must never parse slash commands (they use the commands
+  route); pictures are refused; every message/picture/command route calls `refuseOldClient`. Anything that ends a
+  membership or a device must call `forgetMemberKeys`/`markRekeyNeeded`. Envelopes are insert-only. Account
+  deletion removes the person's devices and envelopes in its transaction.
 - Presence, open votes and the guest-session map are in memory on purpose; a
   restart clears ephemeral history anyway.
 - Foreign key enforcement is off (as it has always been); deletes clean up their

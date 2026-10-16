@@ -286,6 +286,44 @@ export const migrations = [
         END;
       `)
     }
+  },
+  {
+    id: 14,
+    name: 'end-to-end encryption: device keys, wrapped server keys and encrypted messages',
+    up(db) {
+      // Only adds. Nothing changes for an existing server until encryption is switched on for it
+      // (e2ee_enabled stays 0), and the server never holds a key it could read anything with:
+      // public_key is a device's public half, and an envelope is a key wrapped to one device.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS device_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          account_id INTEGER NOT NULL REFERENCES accounts(id),
+          public_key TEXT NOT NULL,
+          label TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          revoked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_device_keys_account ON device_keys(account_id);
+
+        CREATE TABLE IF NOT EXISTS key_envelopes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          server_id INTEGER NOT NULL REFERENCES servers(id),
+          epoch INTEGER NOT NULL,
+          recipient_device_id INTEGER NOT NULL REFERENCES device_keys(id),
+          sender_device_id INTEGER,           -- who wrapped it; NULL once that account is gone. The wrapped data is self-contained.
+          data TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (server_id, epoch, recipient_device_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_key_envelopes_recipient ON key_envelopes(recipient_device_id);
+      `)
+      db.exec('ALTER TABLE servers ADD COLUMN e2ee_enabled INTEGER NOT NULL DEFAULT 0')
+      db.exec('ALTER TABLE servers ADD COLUMN e2ee_epoch INTEGER NOT NULL DEFAULT 0')
+      db.exec('ALTER TABLE servers ADD COLUMN rekey_needed INTEGER NOT NULL DEFAULT 0')
+      // NULL = plain text (every message so far, and the music bot's); a number = the text column holds
+      // ciphertext made with that epoch's key.
+      db.exec('ALTER TABLE messages ADD COLUMN enc_epoch INTEGER')
+    }
   }
 ]
 
