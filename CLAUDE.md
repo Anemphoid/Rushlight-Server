@@ -79,7 +79,7 @@ client lives in a separate repo (Anemphoid/Rushlight) and talks to this over
   `postMessage` stores `rl1.` ciphertext as sent and must never parse slash commands (they use the commands
   route); a picture there must be sealed (`postSealedImage`, framing in `src/e2ee.js`): the server cannot inspect it, so the
   type, size and metadata are the client's job, and `image.sealed` is only present on sealed pictures (plain pictures keep
-  their old shape, a test pins it); every message/picture/command route calls `refuseOldClient`. Anything that ends a
+  their old shape, a test pins it); every message/picture/command route and the member voice token call `refuseOldClient`. Voice: the token answers `encrypted` and `epoch`; guests and Jellybox are refused in an encrypted server until the guest-invite and per-room Jellybox steps exist. Anything that ends a
   membership or a device must call `forgetMemberKeys`/`markRekeyNeeded`. Envelopes are insert-only. Account
   deletion removes the person's devices and envelopes in its transaction.
 - Presence, open votes and the guest-session map are in memory on purpose; a
