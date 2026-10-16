@@ -60,3 +60,25 @@ export function parseEncryptedText(text) {
   const epoch = Number(m[1])
   return epoch >= 1 ? { epoch } : null
 }
+
+// --- Encrypted pictures ---
+// The client seals the picture with a key of its own and puts that key, the type and the size inside the
+// sealed message text, so the server learns nothing about the picture but its length. The upload is one body:
+//   4 bytes  length of the message text (big endian)
+//   N bytes  the sealed message text (rl1.<epoch>.<nonce>.<ciphertext>, ASCII)
+//   rest     the sealed picture: a 12 byte nonce, then the ciphertext with its 16 byte tag
+export const SEALED_IMAGE_MIME = 'application/x-rushlight-sealed'
+export const SEALED_IMAGE_OVERHEAD = 4 + MAX_ENCRYPTED_TEXT + 12 + 16
+
+// Returns { text, epoch, sealed } or null if the body is not shaped like that.
+export function parseSealedImage(buffer, maxPictureBytes) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 4 + 1 + 12 + 16 + 1) return null
+  const n = buffer.readUInt32BE(0)
+  if (n < 1 || n > MAX_ENCRYPTED_TEXT || 4 + n + 12 + 16 + 1 > buffer.length) return null
+  const text = buffer.subarray(4, 4 + n).toString('latin1')
+  const parsed = parseEncryptedText(text)
+  if (!parsed) return null
+  const sealed = buffer.subarray(4 + n)
+  if (sealed.length > maxPictureBytes + 12 + 16) return null
+  return { text, epoch: parsed.epoch, sealed }
+}

@@ -15,7 +15,10 @@ import {
   clientIsRecentEnough,
   cleanPublicKey,
   cleanEnvelopeData,
-  parseEncryptedText
+  parseEncryptedText,
+  SEALED_IMAGE_MIME,
+  SEALED_IMAGE_OVERHEAD,
+  parseSealedImage
 } from './e2ee.js'
 import {
   hashPassword,
@@ -2250,7 +2253,16 @@ function serializeMessage(m) {
     // The music bot's messages have no account behind them.
     bot: m.author_account_id == null,
     // One picture at most; its bytes come from GET /api/images/:id (members only).
-    image: m.image_id ? { id: m.image_id, mime: m.image_mime, width: m.image_width, height: m.image_height } : null
+    // `sealed` pictures (encrypted servers) have their type and size inside the sealed message text.
+    image: m.image_id
+      ? {
+          id: m.image_id,
+          mime: m.image_mime,
+          width: m.image_width,
+          height: m.image_height,
+          ...(m.image_mime === SEALED_IMAGE_MIME ? { sealed: true } : {}) // plain pictures keep their old shape
+        }
+      : null
   }
 }
 
@@ -2395,7 +2407,8 @@ function postCommand(kind, req, res) {
 // space's server can fetch it, and it goes away with its message, whichever way the message goes.
 const MAX_IMAGE_BYTES = Number(process.env.IMAGE_MAX_BYTES) || 5 * 1024 * 1024
 const IMAGE_DAILY_BYTES = Number(process.env.IMAGE_DAILY_BYTES) || 100 * 1024 * 1024 // per person, per 24 hours
-const imageBody = express.raw({ type: ALLOWED_IMAGE_MIME, limit: MAX_IMAGE_BYTES })
+// The raw limit leaves room for a sealed picture's framing; plain pictures are held to MAX_IMAGE_BYTES in postImage.
+const imageBody = express.raw({ type: [...ALLOWED_IMAGE_MIME, SEALED_IMAGE_MIME], limit: MAX_IMAGE_BYTES + SEALED_IMAGE_OVERHEAD })
 const imageLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: Number(process.env.IMAGE_LIMIT) || 10,
@@ -2405,30 +2418,76 @@ const imageLimiter = rateLimit({
   message: { error: 'Too many pictures at once. Wait a minute and try again.' }
 })
 
+// How many bytes of pictures this person has shared in the last day.
+function imageBytesToday(accountId) {
+  return db
+    .prepare(
+      `SELECT COALESCE(SUM(mi.size), 0) AS n FROM message_images mi JOIN messages m ON m.id = mi.message_id
+       WHERE m.author_account_id = ? AND mi.created_at > ?`
+    )
+    .get(accountId, Date.now() - 24 * 60 * 60 * 1000).n
+}
+
+// An encrypted server's picture (see src/e2ee.js): stored as opaque bytes, with the sealed message text as its
+// message. No type check, no metadata stripping: the app already did that before sealing, and the server
+// could not look anyway. Only the size and the daily limit apply.
+function postSealedImage(kind, req, res, serverId) {
+  const sealed = parseSealedImage(req.body, MAX_IMAGE_BYTES)
+  if (!sealed) return res.status(400).json({ error: 'That is not a sealed picture', reason: 'bad_sealed_picture' })
+  const state = e2eeState(serverId)
+  if (sealed.epoch > state.e2ee_epoch) {
+    return res.status(400).json({ error: 'That picture uses a key this server does not have yet', reason: 'unknown_epoch' })
+  }
+  if (imageBytesToday(req.account.sub) + sealed.sealed.length > IMAGE_DAILY_BYTES) {
+    return res.status(429).json({ error: "You've shared a lot of pictures today. Try again tomorrow." })
+  }
+  const spaceId = Number(kind === 'channel' ? req.params.channelId : req.params.roomId)
+  const messageId = db.transaction(() => {
+    const m = insertMessage(kind, spaceId, req.account.sub, req.account.username, cleanColor(req.query.avatarColor), sealed.text, sealed.epoch)
+    db.prepare(
+      'INSERT INTO message_images (message_id, mime, width, height, size, data, created_at) VALUES (?, ?, 0, 0, ?, ?, ?)'
+    ).run(m.id, SEALED_IMAGE_MIME, sealed.sealed.length, sealed.sealed, Date.now())
+    return m.id
+  })()
+  res.json(serializeMessage(messageWithImage(messageId)))
+}
+
+function messageWithImage(messageId) {
+  return db
+    .prepare(
+      `SELECT m.*, accounts.avatar_updated_at AS current_avatar_updated_at,
+              mi.id AS image_id, mi.mime AS image_mime, mi.width AS image_width, mi.height AS image_height
+       FROM messages m LEFT JOIN accounts ON accounts.id = m.author_account_id
+       LEFT JOIN message_images mi ON mi.message_id = m.id WHERE m.id = ?`
+    )
+    .get(messageId)
+}
+
 function postImage(kind, req, res) {
   const imageServerId = serverIdForSpace(kind, Number(kind === 'channel' ? req.params.channelId : req.params.roomId))
   if (refuseOldClient(req, res, imageServerId)) return
-  if (e2eeState(imageServerId).e2ee_enabled) {
-    // The server cannot check or strip a picture it cannot read; encrypted pictures are a later release.
-    return res.status(400).json({ error: 'Pictures are not available in encrypted servers yet', reason: 'encryption_required' })
+  const contentType = String(req.get('content-type') || '').split(';')[0].trim().toLowerCase()
+  const encrypted = !!e2eeState(imageServerId).e2ee_enabled
+  if (contentType === SEALED_IMAGE_MIME) {
+    if (!encrypted) return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+    return postSealedImage(kind, req, res, imageServerId)
+  }
+  if (encrypted) {
+    // The server cannot check or strip a picture it cannot read; an encrypted server only takes sealed ones.
+    return res.status(400).json({ error: 'This server is encrypted. Update Rushlight to send pictures.', reason: 'encryption_required' })
   }
   const buffer = req.body
+  if (Buffer.isBuffer(buffer) && buffer.length > MAX_IMAGE_BYTES) return res.status(413).json({ error: 'The request was too large' })
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     return res.status(400).json({ error: 'Send the picture as the request body (image/jpeg, image/png or image/webp)' })
   }
-  const mime = String(req.get('content-type') || '').split(';')[0].trim().toLowerCase()
+  const mime = contentType
   const caption = typeof req.query.text === 'string' ? req.query.text.trim() : ''
   if (caption.length > 1000) return res.status(400).json({ error: 'The caption is too long' })
   const checked = inspectImage(buffer, mime)
   if (!checked.ok) return res.status(400).json({ error: checked.error })
 
-  const used = db
-    .prepare(
-      `SELECT COALESCE(SUM(mi.size), 0) AS n FROM message_images mi JOIN messages m ON m.id = mi.message_id
-       WHERE m.author_account_id = ? AND mi.created_at > ?`
-    )
-    .get(req.account.sub, Date.now() - 24 * 60 * 60 * 1000).n
-  if (used + checked.clean.length > IMAGE_DAILY_BYTES) {
+  if (imageBytesToday(req.account.sub) + checked.clean.length > IMAGE_DAILY_BYTES) {
     return res.status(429).json({ error: "You've shared a lot of pictures today. Try again tomorrow." })
   }
 
@@ -2470,7 +2529,7 @@ app.get('/api/images/:imageId', requireAuth, (req, res) => {
   if (!row) return res.status(404).json({ error: 'Not found' })
   const serverId = row.channel_id ? serverIdForSpace('channel', row.channel_id) : serverIdForSpace('room', row.room_id)
   if (!serverId || !getMembership(serverId, req.account.sub)) return res.status(404).json({ error: 'Not found' })
-  res.set('Content-Type', row.mime)
+  res.set('Content-Type', row.mime === SEALED_IMAGE_MIME ? 'application/octet-stream' : row.mime)
   res.set('X-Content-Type-Options', 'nosniff')
   res.set('Content-Security-Policy', "default-src 'none'; sandbox")
   res.set('Cache-Control', 'private, max-age=31536000, immutable') // an image never changes under its id
