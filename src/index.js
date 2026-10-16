@@ -18,7 +18,9 @@ import {
   parseEncryptedText,
   SEALED_IMAGE_MIME,
   SEALED_IMAGE_OVERHEAD,
-  parseSealedImage
+  parseSealedImage,
+  cleanCodePackage,
+  cleanCodeSecret
 } from './e2ee.js'
 import {
   hashPassword,
@@ -1496,10 +1498,31 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
   }
   if (!code) return res.status(500).json({ error: 'Could not generate a unique code, try again' })
 
+  // In an encrypted server every invite carries sealed keys (made by the app of whoever creates it); in an
+  // ordinary one there is nothing to carry.
+  const codeState = e2eeState(req.params.id)
+  let sealedKeys = null
+  const keysIn = (req.body || {}).e2ee
+  if (codeState.e2ee_enabled) {
+    if (refuseOldClient(req, res, Number(req.params.id))) return
+    const pkg = keysIn && cleanCodePackage(keysIn.package)
+    const secret = keysIn && cleanCodeSecret(keysIn.secret)
+    const epoch = keysIn && keysIn.epoch
+    if (!pkg || !secret || !Number.isInteger(epoch) || epoch < 1) {
+      return res.status(400).json({ error: 'An invite to an encrypted server must carry its keys. Update Rushlight.', reason: 'package_required' })
+    }
+    if (epoch > codeState.e2ee_epoch || secret.epoch > codeState.e2ee_epoch) {
+      return res.status(400).json({ error: 'That invite uses a key this server does not have yet', reason: 'unknown_epoch' })
+    }
+    sealedKeys = { pkg, secret: secret.value, epoch }
+  } else if (keysIn !== undefined) {
+    return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+  }
+
   const expiresAt = expiresInMinutes ? Date.now() + expiresInMinutes * 60 * 1000 : null
-  db.prepare(
-    `INSERT INTO join_codes (code, server_id, created_by, persistent, single_use, expires_at, created_at, scope_type, scope_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  const inserted = db.prepare(
+    `INSERT INTO join_codes (code, server_id, created_by, persistent, single_use, expires_at, created_at, scope_type, scope_id, key_package, key_secret, key_epoch)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     code,
     req.params.id,
@@ -1509,10 +1532,14 @@ app.post('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =
     expiresAt,
     Date.now(),
     scope ? scope.type : null,
-    scope ? scope.id : null
+    scope ? scope.id : null,
+    sealedKeys ? sealedKeys.pkg : null,
+    sealedKeys ? sealedKeys.secret : null,
+    sealedKeys ? sealedKeys.epoch : null
   )
 
   res.json({
+    id: Number(inserted.lastInsertRowid),
     code,
     persistent: !!persistent,
     singleUse: !!singleUse,
@@ -1527,7 +1554,7 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
   const now = Date.now()
   const rows = db
     .prepare(
-      `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at, scope_type, scope_id FROM join_codes
+      `SELECT id, code, persistent, single_use, used, revoked, expires_at, created_at, scope_type, scope_id, key_package, key_secret, key_epoch, key_version FROM join_codes
        WHERE server_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > ?)
        ORDER BY id DESC`
     )
@@ -1551,6 +1578,8 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
         expiresAt: r.expires_at,
         createdAt: r.created_at,
         guestsNow: guestsByCode.get(r.id) || 0,
+        // the sealed keys an invite to an encrypted server carries (opaque here; an admin's app opens them)
+        e2ee: r.key_package ? { package: r.key_package, secret: r.key_secret, epoch: r.key_epoch, version: r.key_version } : null,
         scope: r.scope_type ? { type: r.scope_type, id: r.scope_id, name: scopeName(scopeOf(r)) } : null
       }))
   })
@@ -1563,9 +1592,11 @@ app.get('/api/servers/:id/codes', requireAuth, requireServerAdmin, (req, res) =>
 // for those.
 app.delete('/api/servers/:id/codes/:codeId', requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
   const codeId = toId(req.params.codeId)
-  const record = codeId && db.prepare('SELECT id FROM join_codes WHERE id = ? AND server_id = ?').get(codeId, req.params.id)
+  const record = codeId && db.prepare('SELECT id, key_package FROM join_codes WHERE id = ? AND server_id = ?').get(codeId, req.params.id)
   if (!record) return res.status(404).json({ error: 'Code not found' })
   db.prepare('UPDATE join_codes SET revoked = 1 WHERE id = ?').run(codeId)
+  // Whoever holds that invite also holds the keys in it, so taking the invite back means a new key.
+  if (record.key_package) markRekeyNeeded(Number(req.params.id))
   await disconnectGuests((g) => g.codeId === codeId)
   res.json({ revoked: true })
 }))
@@ -1782,6 +1813,63 @@ function usableCode(res, code) {
   return record
 }
 
+// What a joiner is told about encryption: whether the server is encrypted, its current key epoch, and the sealed keys
+// the invite carries (opaque to the server; only the secret half of the code opens them).
+function joinKeys(server, record) {
+  if (!server.e2ee_enabled) return { enabled: false }
+  return { enabled: true, epoch: server.e2ee_epoch, package: record.key_package || null, packageEpoch: record.key_epoch || 0 }
+}
+
+// Looks at a code without using it: what it covers and, for an encrypted server, the sealed keys it carries. The app calls
+// this before joining, so an invite pasted without its secret half (or with a typo in it) is refused before it is used up.
+// It tells nothing the join itself would not, and is limited the same way.
+app.post('/api/code-check', joinLimiter, (req, res) => {
+  const record = usableCode(res, (req.body || {}).code)
+  if (!record) return
+  const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(record.server_id)
+  res.json({ serverId: server.id, guestsOnly: !!record.scope_type, e2ee: joinKeys(server, record) })
+})
+
+// A guest's app asks again for the package of the invite it came in with, to pick up the keys of a newer epoch
+// (admins' apps add them when a new key is made). Only for a guest whose invite is still good.
+app.get('/api/guest/key-package', requireAuthOrGuest, (req, res) => {
+  if (!req.guest) return res.status(403).json({ error: 'That is for guests' })
+  const code = guestCodeOrRefuse(res, req.guest)
+  if (!code) return
+  const state = e2eeState(req.guest.serverId)
+  if (!state.e2ee_enabled) return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+  if (refuseOldClient(req, res, req.guest.serverId)) return
+  res.json({ epoch: state.e2ee_epoch, package: code.key_package || null, packageEpoch: code.key_epoch || 0, version: code.key_version })
+})
+
+// An admin's app adds the keys of a newer epoch to an invite's package. Compare-and-swap on the version, so two
+// admins' apps doing it at once cannot overwrite each other.
+app.put('/api/servers/:id/codes/:codeId/package', requireAuth, requireServerAdmin, (req, res) => {
+  const serverId = Number(req.params.id)
+  const state = e2eeState(serverId)
+  if (!state.e2ee_enabled) return res.status(409).json({ error: 'Encryption is not on for this server', reason: 'e2ee_off' })
+  if (refuseOldClient(req, res, serverId)) return
+  const codeId = toId(req.params.codeId)
+  const row = codeId && db.prepare('SELECT * FROM join_codes WHERE id = ? AND server_id = ? AND revoked = 0').get(codeId, serverId)
+  if (!row || !row.key_package) return res.status(404).json({ error: 'Code not found' })
+  const body = req.body || {}
+  const pkg = cleanCodePackage(body.package)
+  if (!pkg || !Number.isInteger(body.epoch) || !Number.isInteger(body.version)) {
+    return res.status(400).json({ error: 'package, epoch and version are required' })
+  }
+  if (body.version !== row.key_version) {
+    return res.status(409).json({ error: 'Another admin updated that invite first', reason: 'package_changed' })
+  }
+  if (body.epoch <= row.key_epoch || body.epoch > state.e2ee_epoch) {
+    return res.status(400).json({ error: 'epoch must be newer than the one in the package, and one this server has', reason: 'bad_epoch' })
+  }
+  const done = db
+    .prepare('UPDATE join_codes SET key_package = ?, key_epoch = ?, key_version = key_version + 1 WHERE id = ? AND key_version = ?')
+    .run(pkg, body.epoch, codeId, body.version)
+  if (!done.changes) return res.status(409).json({ error: 'Another admin updated that invite first', reason: 'package_changed' })
+  res.json({ updated: true, version: body.version + 1 })
+})
+
 app.post('/api/servers/join', joinLimiter, requireAuth, (req, res) => {
   const record = usableCode(res, (req.body || {}).code)
   if (!record) return
@@ -1813,7 +1901,7 @@ app.post('/api/servers/join', joinLimiter, requireAuth, (req, res) => {
   }
 
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(record.server_id)
-  res.json({ id: server.id, name: server.name, isAdmin: !!(already && already.is_admin) })
+  res.json({ id: server.id, name: server.name, isAdmin: !!(already && already.is_admin), e2ee: joinKeys(server, record) })
 })
 
 // --- Joining (anonymous, via code — no account, no persistent membership) ---
@@ -1827,6 +1915,18 @@ app.post('/api/join', joinLimiter, (req, res) => {
 
   const record = usableCode(res, body.code)
   if (!record) return
+
+  // A guest of an encrypted server needs the keys an invite made for it carries, and an app that can use them.
+  // An invite made before the server was encrypted has none, and is refused before anything is used up.
+  if (e2eeState(record.server_id).e2ee_enabled) {
+    if (refuseOldClient(req, res, record.server_id)) return
+    if (!record.key_package) {
+      return res.status(409).json({
+        error: 'That invite was made before this server was encrypted. Ask for a new one.',
+        reason: 'old_invite'
+      })
+    }
+  }
 
   // A guest can't borrow the name of an account (that includes accounts that
   // were muted or banned, who could otherwise come straight back unrecognized),
@@ -1868,7 +1968,8 @@ app.post('/api/join', joinLimiter, (req, res) => {
       name: server.name,
       isAdmin: false,
       channels: serializeTree(server.id, scopeOf(record)),
-      presence: {} // a guest sees who is in their own space once they are in one
+      presence: {}, // a guest sees who is in their own space once they are in one
+      e2ee: joinKeys(server, record)
     }
   })
 })
@@ -1989,16 +2090,19 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
     if (req.guest.serverId !== space.server_id) {
       return res.status(403).json({ error: "You weren't invited to that server" })
     }
-    if (encrypted) {
-      // A guest has no account and so no device to hold the key; invites that carry one come in a later release.
-      return res.status(409).json({ error: "This server's voice is encrypted. Guests can't join it yet.", reason: 'guest_encrypted' })
-    }
     // The code they came in with must still be good: revoking it ends their access.
     // And it may be for one channel or room only.
     const code = guestCodeOrRefuse(res, req.guest)
     if (!code) return
     if (!scopeAllows(code, type, spaceId)) {
       return res.status(403).json({ error: "Your invite doesn't cover that space" })
+    }
+    if (encrypted) {
+      // A guest has no account and so no device; the keys come in the invite they joined with.
+      if (refuseOldClient(req, res, space.server_id)) return
+      if (!code.key_package) {
+        return res.status(409).json({ error: "This server's voice is encrypted, and your invite doesn't carry its key. Ask for a new invite.", reason: 'guest_encrypted' })
+      }
     }
     identity = req.guest.identity
     name = req.guest.screenName
@@ -2818,6 +2922,7 @@ app.delete('/api/servers/:id/guests/:identity', requireAuth, requireServerAdmin,
   if (!g || g.serverId !== serverId) return res.status(404).json({ error: 'That guest is no longer here' })
   removedGuests.set(identity, g.expiresAt)
   await endGuestSession(identity, g)
+  markRekeyNeeded(serverId) // they held the key of a voice room
   res.json({ removed: true })
 }))
 

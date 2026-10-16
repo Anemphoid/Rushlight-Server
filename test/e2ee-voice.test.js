@@ -106,23 +106,12 @@ test("someone who is not a member still gets the usual refusal, not a hint about
   assert.equal(r.data.encrypted, undefined)
 })
 
-test('a guest cannot join the voice of an encrypted server, and still can in an ordinary one', async () => {
+test('an invite made before the server was encrypted cannot bring a guest into it', async () => {
   const w = await world()
-  const joined = await call('POST', '/api/join', { code: w.code.code, screenName: 'Visitor' })
-  assert.equal(joined.status, 200, JSON.stringify(joined.data))
-  const guest = { token: joined.data.guestToken }
-  const refused = await voiceToken(w, guest, {})
-  assert.equal(refused.status, 409)
-  assert.equal(refused.data.reason, 'guest_encrypted')
-  assert.equal(refused.data.token, undefined)
-  const withVersion = await voiceToken(w, guest)
-  assert.equal(withVersion.status, 409)
-
-  const plain = await world({ encrypted: false })
-  const g2 = await call('POST', '/api/join', { code: plain.code.code, screenName: 'Visitor Two' })
-  const ok = await voiceToken(plain, { token: g2.data.guestToken }, {})
-  assert.equal(ok.status, 200)
-  assert.equal(ok.data.encrypted, false)
+  const joined = await call('POST', '/api/join', { code: w.code.code, screenName: 'Visitor' }, undefined, CLIENT)
+  assert.equal(joined.status, 409, JSON.stringify(joined.data))
+  assert.equal(joined.data.reason, 'old_invite')
+  assert.equal(joined.data.guestToken, undefined)
 })
 
 test("Jellybox says it isn't available in an encrypted server, and its controls refuse", async () => {
