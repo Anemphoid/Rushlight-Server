@@ -488,6 +488,12 @@ design is in the Rushlight roadmap. What the server does and does not do:
   (`reason: client_too_old`, with `minClient`) to message, picture and command requests from one that is missing,
   unreadable or older than `E2EE_MIN_CLIENT` (default 0.22.0). `GET /api/servers/:id` stays open, so an old client
   can say why.
+- **Voice.** The audio is encrypted by the apps (LiveKit's end-to-end encryption, with keys derived from the server
+  key), so the server only guards the door. `POST /api/voice/token` answers `encrypted` and `epoch` for every room. In
+  an encrypted server it gives a member's connection only to an app that sends `X-Rushlight-Client` of
+  `E2EE_MIN_CLIENT` or newer (426 `client_too_old` otherwise), refuses guests (409 `guest_encrypted`; invites that carry
+  a key come later), and Jellybox is off: `/play` and the other commands answer that it isn't available in encrypted
+  servers yet, and the control route answers 409 `encrypted`. The server and LiveKit only ever see encrypted frames.
 - A server without encryption is unchanged: plain text, slash commands in chat, no version needed.
 
 ## Not built yet

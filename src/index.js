@@ -1977,12 +1977,21 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
   if (!space) return res.status(404).json({ error: 'Not found' })
   if (space.mode === 'text') return res.status(400).json({ error: 'That space has no voice' })
 
+  // An encrypted server's voice is end-to-end encrypted by the clients; the server cannot do that for anyone, so
+  // it only hands out a connection to people who can (an up-to-date member app) and tells them the room is encrypted.
+  const voiceState = e2eeState(space.server_id)
+  const encrypted = !!voiceState.e2ee_enabled
+
   let identity
   let name
   let mutedOnJoin = false
   if (req.guest) {
     if (req.guest.serverId !== space.server_id) {
       return res.status(403).json({ error: "You weren't invited to that server" })
+    }
+    if (encrypted) {
+      // A guest has no account and so no device to hold the key; invites that carry one come in a later release.
+      return res.status(409).json({ error: "This server's voice is encrypted. Guests can't join it yet.", reason: 'guest_encrypted' })
     }
     // The code they came in with must still be good: revoking it ends their access.
     // And it may be for one channel or room only.
@@ -1996,6 +2005,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
   } else {
     const membership = getMembership(space.server_id, req.account.sub)
     if (!membership) return notAMember(res, space.server_id, req.account.sub)
+    if (refuseOldClient(req, res, space.server_id)) return
     identity = `acct-${req.account.sub}`
     name = req.account.username
     mutedOnJoin = !!membership.muted
@@ -2008,7 +2018,7 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
     // restart this is rebuilt as guests ask for tokens again.
     ensureGuestSession(req.guest).rooms.add(room)
   }
-  res.json({ token, livekitUrl: LIVEKIT_URL, room })
+  res.json({ token, livekitUrl: LIVEKIT_URL, room, encrypted, epoch: voiceState.e2ee_epoch })
 }))
 
 // --- End-to-end encryption: devices and wrapped keys ---------------------
@@ -2373,6 +2383,12 @@ function runCommand(kind, spaceId, account, text) {
   const space = lookupSpace(kind, spaceId)
   const membership = space ? getMembership(space.server_id, account.sub) : null
   if (!space || !membership) return
+  if (e2eeState(space.server_id).e2ee_enabled) {
+    // The bot plays audio from the server, which cannot be encrypted end to end, and it would be unheard in a room
+    // whose members encrypt theirs. A per-room switch for this comes later.
+    postBotMessage(kind, spaceId, "Jellybox isn't available in encrypted servers yet.")
+    return
+  }
   const ctx = {
     serverId: space.server_id,
     type: kind,
@@ -2705,6 +2721,7 @@ app.post('/api/music/:type/:spaceId/control', musicLimiter, requireAuth, musicSp
   if (!req.isMusicAdmin) return res.status(403).json({ error: 'Admin only' })
   const { type, spaceId, serverId, mode } = req.musicSpace
   if (mode === 'text') return res.status(400).json({ error: 'That space has no voice' })
+  if (e2eeState(serverId).e2ee_enabled) return res.status(409).json({ error: "Jellybox isn't available in encrypted servers yet.", reason: 'encrypted' })
   const space = presence.get(spaceKey(type, spaceId))
   if (!space || !space.entries.has(req.account.sub)) return res.status(409).json({ error: 'Join the voice room first' })
   const { action, itemId, kind, value } = req.body || {}
