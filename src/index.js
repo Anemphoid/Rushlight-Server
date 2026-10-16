@@ -1827,7 +1827,7 @@ app.post('/api/code-check', joinLimiter, (req, res) => {
   const record = usableCode(res, (req.body || {}).code)
   if (!record) return
   const server = db.prepare('SELECT * FROM servers WHERE id = ?').get(record.server_id)
-  res.json({ guestsOnly: !!record.scope_type, e2ee: joinKeys(server, record) })
+  res.json({ serverId: server.id, guestsOnly: !!record.scope_type, e2ee: joinKeys(server, record) })
 })
 
 // A guest's app asks again for the package of the invite it came in with, to pick up the keys of a newer epoch

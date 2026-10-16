@@ -265,7 +265,7 @@ test('a code can be looked at without being used, so a wrong or missing secret h
   const oneShot = (await mk(w, { singleUse: true, expiresInMinutes: null, e2ee: k, scope: { type: 'channel', id: w.channel.id } })).data
   const first = await call('POST', '/api/code-check', { code: oneShot.code }, undefined, {})
   assert.equal(first.status, 200, JSON.stringify(first.data))
-  assert.deepEqual(first.data, { guestsOnly: true, e2ee: { enabled: true, epoch: 1, package: k.package, packageEpoch: 1 } })
+  assert.deepEqual(first.data, { serverId: w.s.id, guestsOnly: true, e2ee: { enabled: true, epoch: 1, package: k.package, packageEpoch: 1 } })
   await call('POST', '/api/code-check', { code: oneShot.code }, undefined, {})
   assert.equal(rows('SELECT used FROM join_codes WHERE id = ?', oneShot.id)[0].used, 0, 'looking is not using')
   assert.equal((await call('POST', '/api/join', { code: oneShot.code, screenName: 'Visitor' })).status, 200, 'it still works for the guest it was made for')
@@ -273,9 +273,9 @@ test('a code can be looked at without being used, so a wrong or missing secret h
 
   // an older invite in an encrypted server shows that it carries nothing, a plain server says it is not encrypted
   const old = await call('POST', '/api/code-check', { code: w.plainCode.code }, undefined, {})
-  assert.deepEqual(old.data, { guestsOnly: false, e2ee: { enabled: true, epoch: 1, package: null, packageEpoch: 0 } })
+  assert.deepEqual(old.data, { serverId: w.s.id, guestsOnly: false, e2ee: { enabled: true, epoch: 1, package: null, packageEpoch: 0 } })
   const p = await world({ encrypted: false })
-  assert.deepEqual((await call('POST', '/api/code-check', { code: p.plainCode.code }, undefined, {})).data, { guestsOnly: false, e2ee: { enabled: false } })
+  assert.deepEqual((await call('POST', '/api/code-check', { code: p.plainCode.code }, undefined, {})).data, { serverId: p.s.id, guestsOnly: false, e2ee: { enabled: false } })
   // unknown, revoked, and nonsense
   assert.equal((await call('POST', '/api/code-check', { code: 'no-such-0000' }, undefined, {})).status, 404)
   assert.equal((await call('POST', '/api/code-check', {}, undefined, {})).status, 400)
