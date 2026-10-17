@@ -34,9 +34,9 @@ test('an existing database upgrades in place and keeps its data', async () => {
   oldDatabase(path)
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 11 migration/)
+    assert.match(srv.log(), /Applied 12 migration/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT revoked FROM join_codes').get().revoked, 0)
     assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_accounts_username_nocase'").get())
@@ -79,9 +79,9 @@ test('an install already at migration 6 (the released v0.2.0) applies the newer 
   oldDatabase(path, { upTo: 6 })
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 9 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 10 migration\(s\): remember why someone lost access to a server, join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n, 2)
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM access_ends').get().n, 0)
     db.close()
@@ -103,9 +103,9 @@ test('an install at migration 7 (the released v0.3.0) gets scoped codes and its 
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 8 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 9 migration\(s\): join codes can be limited to one channel or room, account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
     const row = db.prepare('SELECT scope_type, scope_id FROM join_codes').get()
     assert.deepEqual(row, { scope_type: null, scope_id: null }) // old codes stay server-wide
     db.close()
@@ -130,7 +130,7 @@ test('an install at migration 8 (the released v0.4.1) keeps every account workin
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 7 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 8 migration\(s\): account recovery keys and sign-out-everywhere, messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
     const cols = db.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name)
     for (const c of ['recovery_key_hash', 'pending_recovery_key_hash', 'recovery_key_set_at', 'session_epoch']) assert.ok(cols.includes(c), c)
@@ -161,9 +161,9 @@ test('an install at migration 9 (the released v0.7.0) keeps every message, none 
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 6 migration\(s\): messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 7 migration\(s\): messages can be redacted when their author deletes their account, a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
-    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    assert.deepEqual(db.prepare('SELECT id FROM schema_migrations ORDER BY id').all().map((r) => r.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
     assert.deepEqual(
       db.prepare('SELECT text, author_name, author_account_id, redacted FROM messages').get(),
       { text: 'written before redaction existed', author_name: 'Anemphoid', author_account_id: 1, redacted: 0 }
@@ -185,7 +185,7 @@ test('an install at migration 10 (the released v0.8.0) gains the empty music tab
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 5 migration\(s\): a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 6 migration\(s\): a server can link a Jellyfin library for the Jellybox music bot, persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM server_music').get().n, 0)
     assert.equal(db.prepare('SELECT text FROM messages').get().text, 'before the music bot')
@@ -206,7 +206,7 @@ test('an install at migration 11 (the released v0.9.x): every server gets a 12 m
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 4 migration\(s\): persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 5 migration\(s\): persistent chat history is kept for a number of months per server, chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
     assert.deepEqual(db.prepare('SELECT retention_months FROM servers').all(), [{ retention_months: 12 }])
     assert.equal(db.prepare('SELECT text FROM messages').get().text, 'recent')
@@ -227,7 +227,7 @@ test('an install at migration 12 (the released v0.11.x): gains the picture table
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 3 migration\(s\): chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 4 migration\(s\): chat messages can carry one picture, end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
     assert.equal(db.prepare('SELECT text FROM messages').get().text, 'kept')
     assert.equal(db.prepare('SELECT COUNT(*) AS n FROM message_images').get().n, 0)
@@ -248,7 +248,7 @@ test('an install at migration 13 (the released v0.12.0): gains the key tables, e
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 2 migration\(s\): end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 3 migration\(s\): end-to-end encryption: device keys, wrapped server keys and encrypted messages, join codes can carry sealed encryption keys, a per-room switch for Jellybox in encrypted servers/)
     const db = new Database(path, { readonly: true })
     const m = db.prepare('SELECT text, enc_epoch FROM messages').get()
     assert.equal(m.text, 'kept')
@@ -273,7 +273,7 @@ test('an install at migration 14 (the released v0.15.x): invites gain room for s
   seed.close()
   const srv = await startServer({ dbPath: path })
   try {
-    assert.match(srv.log(), /Applied 1 migration\(s\): join codes can carry sealed encryption keys/)
+    assert.match(srv.log(), /Applied 2 migration\(s\): join codes can carry sealed encryption keys, a per-room switch/)
     const db = new Database(path, { readonly: true })
     const c = db.prepare("SELECT code, key_package, key_secret, key_epoch, key_version FROM join_codes WHERE code = 'old-code-1111'").get()
     assert.deepEqual({ ...c }, { code: 'old-code-1111', key_package: null, key_secret: null, key_epoch: null, key_version: 0 })

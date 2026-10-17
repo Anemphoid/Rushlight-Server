@@ -114,7 +114,19 @@ test('an invite made before the server was encrypted cannot bring a guest into i
   assert.equal(joined.data.guestToken, undefined)
 })
 
-test("Jellybox says it isn't available in an encrypted server, and its controls refuse", async () => {
+async function botMessages(w, id = w.channel.id, n = 1, type = 'channels') {
+  let bots = []
+  for (let i = 0; i < 50 && bots.length < n; i++) {
+    const m = (await call('GET', `/api/${type}/${id}/messages`, undefined, w.owner.token, CLIENT)).data.messages
+    bots = m.filter((x) => x.bot)
+    if (bots.length < n) await new Promise((r) => setTimeout(r, 100))
+  }
+  return bots
+}
+const allow = (w, open, who = w.owner, type = 'channel', id = w.channel.id) =>
+  call('PUT', `/api/music/${type}/${id}/allowed`, { open }, who.token, CLIENT)
+
+test("Jellybox is not allowed in an encrypted server's rooms until an admin allows it, and its controls refuse", async () => {
   const w = await world()
   await call('POST', `/api/channels/${w.channel.id}/commands`, { text: '/play something' }, w.owner.token, CLIENT)
   let bot
@@ -123,9 +135,65 @@ test("Jellybox says it isn't available in an encrypted server, and its controls 
     bot = m.find((x) => x.bot)
     if (!bot) await new Promise((r) => setTimeout(r, 100))
   }
-  assert.match(bot.text, /isn't available in encrypted servers/)
+  assert.match(bot.text, /isn't allowed in this room/)
+  const tree = (await call('GET', `/api/servers/${w.s.id}`, undefined, w.owner.token, CLIENT)).data
+  assert.equal(tree.channels[0].jellyboxOpen, false)
   const control = await call('POST', `/api/music/channel/${w.channel.id}/control`, { action: 'pause' }, w.owner.token, CLIENT)
   assert.equal(control.status, 409)
-  assert.equal(control.data.reason, 'encrypted')
+  assert.equal(control.data.reason, 'jellybox_closed')
   assert.equal(rows('SELECT COUNT(*) AS n FROM messages WHERE author_account_id IS NULL AND channel_id = ?', w.channel.id)[0].n, 1)
+})
+
+test('allowing Jellybox in one room takes only that room out of the end-to-end layer, and says so', async () => {
+  const w = await world()
+  const room = (await call('POST', `/api/servers/${w.s.id}/channels/${w.channel.id}/rooms`, { name: 'Side', mode: 'both', persistent: true }, w.owner.token)).data
+  const first = await allow(w, true, w.owner, 'room', room.id)
+  assert.equal(first.status, 200, JSON.stringify(first.data))
+  assert.equal(first.data.jellyboxOpen, true)
+  // that room: no end-to-end voice, and the token says why; the channel and the server's other voice are unchanged
+  const open = await call('POST', '/api/voice/token', { type: 'room', id: room.id }, w.member.token, CLIENT)
+  assert.equal(open.data.encrypted, false)
+  assert.equal(open.data.jellyboxOpen, true)
+  const other = await voiceToken(w, w.member)
+  assert.equal(other.data.encrypted, true)
+  assert.equal(other.data.jellyboxOpen, undefined)
+  const tree = (await call('GET', `/api/servers/${w.s.id}`, undefined, w.member.token, CLIENT)).data.channels[0]
+  assert.equal(tree.jellyboxOpen, false)
+  assert.equal(tree.rooms[0].jellyboxOpen, true)
+  // the room's chat is told, by name, in words that are not an alarm
+  const [notice] = await botMessages(w, room.id, 1, 'rooms')
+  assert.match(notice.text, /allowed Jellybox in this room/)
+  assert.match(notice.text, /Chat stays private/)
+  // a command now gets past the gate (there is no library linked here, so it says that instead)
+  await call('POST', `/api/rooms/${room.id}/commands`, { text: '/play something' }, w.owner.token, CLIENT)
+  const bots = await botMessages(w, room.id, 2, 'rooms')
+  assert.doesNotMatch(bots[1].text, /isn't allowed in this room/)
+  // allowing it again changes nothing and says nothing
+  await allow(w, true, w.owner, 'room', room.id)
+  assert.equal((await botMessages(w, room.id, 2, 'rooms')).length, 2)
+  // switching it off puts the encryption back
+  assert.equal((await allow(w, false, w.owner, 'room', room.id)).status, 200)
+  assert.equal((await call('POST', '/api/voice/token', { type: 'room', id: room.id }, w.member.token, CLIENT)).data.encrypted, true)
+  assert.match((await botMessages(w, room.id, 3, 'rooms'))[2].text, /end-to-end encrypted again/)
+})
+
+test('only an admin can change the switch, only in an encrypted server, only for a space with voice', async () => {
+  const w = await world()
+  assert.equal((await allow(w, true, w.member)).status, 403)
+  assert.equal((await call('PUT', `/api/music/channel/${w.channel.id}/allowed`, { open: 'yes' }, w.owner.token, CLIENT)).status, 400)
+  assert.equal((await call('POST', '/api/voice/token', { type: 'channel', id: w.channel.id }, w.member.token, CLIENT)).data.encrypted, true)
+  const text = (await call('POST', `/api/servers/${w.s.id}/channels`, { name: 'Notes', mode: 'text', persistent: true }, w.owner.token)).data
+  assert.equal((await allow(w, true, w.owner, 'channel', text.id)).status, 400)
+  const plain = await world({ encrypted: false })
+  const r = await allow(plain, true)
+  assert.equal(r.status, 409)
+  assert.equal(r.data.reason, 'not_encrypted')
+})
+
+test('a voice-only room has no chat to post the notice in, and still switches', async () => {
+  const w = await world()
+  const vo = (await call('POST', `/api/servers/${w.s.id}/channels`, { name: 'Talk', mode: 'voice', persistent: true }, w.owner.token)).data
+  assert.equal((await allow(w, true, w.owner, 'channel', vo.id)).status, 200)
+  assert.equal((await call('POST', '/api/voice/token', { type: 'channel', id: vo.id }, w.member.token, CLIENT)).data.encrypted, false)
+  assert.equal(rows('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?', vo.id)[0].n, 0)
 })
