@@ -68,7 +68,9 @@ export class Jellyfin {
 
   headers(extra = {}) {
     const auth = `MediaBrowser Client="Rushlight", Device="Rushlight server", DeviceId="rushlight-jellybox", Version="1"${this.token ? `, Token="${this.token}"` : ''}`
-    return { 'X-Emby-Authorization': auth, Accept: 'application/json', ...extra }
+    // The standard header. Jellyfin 12 switches the old X-Emby-Authorization / X-MediaBrowser-Token / api_key ways
+    // of signing in off by default (existing installs included), which made every request here answer 401.
+    return { Authorization: auth, Accept: 'application/json', ...extra }
   }
 
   // streaming: the timeout only covers waiting for Jellyfin to start answering. A song streams for as long as
