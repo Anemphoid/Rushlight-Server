@@ -45,7 +45,8 @@ export async function startFakeJellyfin({ seconds = 1.5, dropFirstAfterBytes = 0
   const requests = []
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://x')
-    const auth = req.headers['x-emby-authorization'] || ''
+    // like Jellyfin 12: only the standard Authorization header counts; the legacy ones are ignored
+    const auth = req.headers['authorization'] || ''
     const token = (/Token="([^"]*)"/.exec(auth) || [])[1] || null
     requests.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), token })
     const json = (code, body) => {
