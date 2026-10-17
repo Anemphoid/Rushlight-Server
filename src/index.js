@@ -2870,6 +2870,73 @@ app.put('/api/music/:type/:spaceId/allowed', musicLimiter, requireAuth, musicSpa
   res.json({ ok: true, jellyboxOpen: open })
 }))
 
+// --- Switching encryption on for an existing server ------------------------
+// Owner only, with their password. Everything said in the server so far is plain text on this machine, so the
+// switch wipes it: every message and picture, bot messages included, then compacts the database so the deleted
+// text does not linger in free pages. Nothing is carried over into the encrypted server; its history starts empty.
+// It cannot be switched back off: the keys are held by the members' computers, not here. The owner's app starts the
+// first key straight afterwards (epoch 0 means "no key yet"), and members on older apps are turned away (426) until
+// they update, which is why the preview says how many members have already got a device.
+const SERVER_MESSAGES = `(
+  channel_id IN (SELECT id FROM channels WHERE server_id = @server)
+  OR room_id IN (SELECT rooms.id FROM rooms JOIN channels ON rooms.channel_id = channels.id WHERE channels.server_id = @server)
+)`
+
+function encryptionPreview(serverId) {
+  const state = e2eeState(serverId)
+  const plainMessages = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE enc_epoch IS NULL AND ${SERVER_MESSAGES}`).get({ server: serverId }).n
+  const plainPictures = db
+    .prepare(`SELECT COUNT(*) AS n FROM message_images WHERE message_id IN (SELECT id FROM messages WHERE enc_epoch IS NULL AND ${SERVER_MESSAGES})`)
+    .get({ server: serverId }).n
+  const members = db.prepare('SELECT COUNT(*) AS n FROM server_members WHERE server_id = ?').get(serverId).n
+  const withDevice = db
+    .prepare(
+      `SELECT COUNT(DISTINCT sm.account_id) AS n FROM server_members sm
+       JOIN device_keys d ON d.account_id = sm.account_id AND d.revoked_at IS NULL WHERE sm.server_id = ?`
+    )
+    .get(serverId).n
+  return { enabled: !!state.e2ee_enabled, epoch: state.e2ee_epoch, plainMessages, plainPictures, members, membersReady: withDevice, minClient: MIN_E2EE_CLIENT }
+}
+
+app.get('/api/servers/:id/encryption', requireAuth, requireServerOwner, (req, res) => {
+  res.json(encryptionPreview(Number(req.params.id)))
+})
+
+app.post('/api/servers/:id/encryption/enable', accountSecretsLimiter, requireAuth, requireServerOwner, asyncHandler(async (req, res) => {
+  const { password, wipe } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const me = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(req.account.sub)
+  if (!me || !(await verifyPassword(password, me.password_hash))) return res.status(401).json({ error: 'Incorrect password' })
+  // checking the password took a moment: make sure they still own it
+  if (ownerIdOf(req.params.id) !== req.account.sub) return res.status(403).json({ error: 'Only the server owner can do that' })
+  const serverId = Number(req.params.id)
+  if (e2eeState(serverId).e2ee_enabled) return res.status(409).json({ error: 'Encryption is already on for this server', reason: 'already_enabled' })
+  // An app too old to encrypt would lock its own owner out the moment this goes through.
+  if (!clientIsRecentEnough(req.get('x-rushlight-client'))) {
+    return res.status(426).json({ error: 'Update Rushlight before switching encryption on.', reason: 'client_too_old', minClient: MIN_E2EE_CLIENT })
+  }
+  // The first key is made by an admin's app, which needs a device of its own to wrap it to.
+  const hasDevice = db.prepare('SELECT 1 FROM device_keys WHERE account_id = ? AND revoked_at IS NULL').get(req.account.sub)
+  if (!hasDevice) return res.status(409).json({ error: 'This computer has no encryption key yet. Open the server once more and try again.', reason: 'owner_needs_device' })
+  const before = encryptionPreview(serverId)
+  if (before.plainMessages > 0 && wipe !== true) {
+    return res.status(409).json({ error: 'Switching on encryption wipes the old messages. Confirm that to go on.', reason: 'wipe_required', ...before })
+  }
+  db.transaction(() => {
+    db.prepare(`DELETE FROM messages WHERE ${SERVER_MESSAGES}`).run({ server: serverId })
+    db.prepare('UPDATE servers SET e2ee_enabled = 1, e2ee_epoch = 0, rekey_needed = 0 WHERE id = ?').run(serverId)
+  })()
+  await music.stopForServer(serverId)
+  try {
+    db.exec('VACUUM')
+    db.pragma('wal_checkpoint(TRUNCATE)') // nothing of the old text stays behind in the write-ahead log either
+  } catch (err) {
+    console.error('could not compact the database after the wipe:', err.message)
+  }
+  console.log(`Encryption switched on for server ${serverId} by account ${req.account.sub}; wiped ${before.plainMessages} messages and ${before.plainPictures} pictures`)
+  res.json({ enabled: true, wiped: { messages: before.plainMessages, pictures: before.plainPictures } })
+}))
+
 // --- Presence routes ---
 
 // Check in to a channel or room. Returns everyone currently in this server's

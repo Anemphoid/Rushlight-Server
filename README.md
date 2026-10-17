@@ -499,6 +499,14 @@ design is in the Rushlight roadmap. What the server does and does not do:
   (chat stays encrypted); the tree shows `jellyboxOpen` for every channel and room, the room's chat gets a plain bot
   notice naming the admin, and switching it off stops the bot and puts the encryption back. Other rooms are unaffected.
   Otherwise the server and LiveKit only ever see encrypted frames.
+- **Switching it on.** `GET /api/servers/:id/encryption` (owner only) previews: how many plain messages and pictures
+  would be wiped, how many members have a device already (`membersReady`, the rest cannot use the server until they
+  update). `POST /api/servers/:id/encryption/enable` (owner, with their password, from an app of `E2EE_MIN_CLIENT` or
+  newer, with a device of their own) deletes every message and picture of that server, the music bot's included,
+  stops Jellybox, compacts the database (`VACUUM`, then truncates the write-ahead log) so the old words are not left in
+  free pages, and sets `e2ee_enabled` with epoch 0; the owner's app then makes the first key. `wipe: true` is required
+  when there is anything to wipe (409 `wipe_required`). It cannot be switched back off. Other servers on the same
+  database are untouched. Logs a line saying who and how much.
 - **Invites carry keys.** In an encrypted server every invite is the visible code plus a secret half the server never
   sees. The creating app seals the keys the joiner needs (the server keys for a whole-server invite, the voice keys of
   one room for a guest invite) under that secret. `POST /api/servers/:id/codes` must carry `e2ee: { package, secret,
