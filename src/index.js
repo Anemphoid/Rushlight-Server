@@ -20,7 +20,14 @@ import {
   SEALED_IMAGE_OVERHEAD,
   parseSealedImage,
   cleanCodePackage,
-  cleanCodeSecret
+  cleanCodeSecret,
+  PAIRING_CODE_MINUTES,
+  APPROVAL_MINUTES,
+  newPairingCode,
+  normalizePairingCode,
+  hashPairingCode,
+  sha256hex,
+  sealToDevice
 } from './e2ee.js'
 import {
   hashPassword,
@@ -2172,7 +2179,23 @@ function activeDevices(accountId) {
 }
 
 function serializeDevice(d) {
-  return { id: d.id, label: d.label, publicKey: d.public_key, createdAt: d.created_at }
+  // approved: false = waiting for one of the account's approved computers to vouch for it; it holds no keys yet
+  return {
+    id: d.id,
+    label: d.label,
+    publicKey: d.public_key,
+    createdAt: d.created_at,
+    approved: !!d.approved_at,
+    ...(d.approved_at ? {} : { pairingExpiresAt: d.pairing_expires && d.pairing_expires > Date.now() ? d.pairing_expires : null })
+  }
+}
+
+const MAX_PENDING_DEVICES = 3
+const PENDING_KEEP_MS = 7 * 24 * 60 * 60 * 1000
+
+function newPairing() {
+  const code = newPairingCode()
+  return { code, hash: hashPairingCode(normalizePairingCode(code)), expires: Date.now() + PAIRING_CODE_MINUTES * 60 * 1000 }
 }
 
 const deviceLimiter = rateLimit({
@@ -2197,12 +2220,109 @@ app.post('/api/devices', requireAuth, deviceLimiter, (req, res) => {
   if (have.length >= MAX_ACTIVE_DEVICES) {
     return res.status(409).json({ error: `You can have up to ${MAX_ACTIVE_DEVICES} devices. Remove one first.`, reason: 'device_limit' })
   }
+  // An account's very first computer has nobody to vouch for it and is approved at once. Any later one waits for an
+  // approved computer of the same account (or, when the account has none left, for the recovery key).
+  const everHad = db.prepare('SELECT 1 FROM device_keys WHERE account_id = ?').get(req.account.sub)
+  if (everHad) {
+    const waiting = have.filter((d) => !d.approved_at).length
+    if (waiting >= MAX_PENDING_DEVICES) {
+      return res.status(409).json({ error: 'Too many computers are waiting for approval. Remove the ones you do not know first.', reason: 'too_many_pending' })
+    }
+  }
+  const now = Date.now()
+  const pairing = everHad ? newPairing() : null
   const info = db
-    .prepare('INSERT INTO device_keys (account_id, public_key, label, created_at) VALUES (?, ?, ?, ?)')
-    .run(req.account.sub, publicKey, label, Date.now())
+    .prepare('INSERT INTO device_keys (account_id, public_key, label, created_at, approved_at, pairing_hash, pairing_expires) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(req.account.sub, publicKey, label, now, everHad ? null : now, pairing ? pairing.hash : null, pairing ? pairing.expires : null)
   const row = db.prepare('SELECT * FROM device_keys WHERE id = ?').get(info.lastInsertRowid)
-  res.json({ ...serializeDevice(row), created: true })
+  res.json({ ...serializeDevice(row), created: true, ...(pairing ? { pairing: { code: pairing.code, expiresAt: pairing.expires } } : {}) })
 })
+
+// A waiting computer asks for a fresh code (the old one runs out after 5 minutes). Only the code is new.
+app.post('/api/devices/:id/pairing-code', requireAuth, deviceLimiter, (req, res) => {
+  const device = db
+    .prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NULL')
+    .get(Number(req.params.id), req.account.sub)
+  if (!device) return res.status(404).json({ error: 'That computer is not waiting for approval' })
+  const pairing = newPairing()
+  db.prepare('UPDATE device_keys SET pairing_hash = ?, pairing_expires = ? WHERE id = ?').run(pairing.hash, pairing.expires, device.id)
+  res.json({ pairing: { code: pairing.code, expiresAt: pairing.expires } })
+})
+
+// --- Approving a new computer (two steps, from a computer that is already approved) ---
+// 1. begin: the code read off the new computer's screen, and which approved device of mine is asking. The answer names
+//    the new computer and carries a challenge sealed to the approving device's public key.
+// 2. confirm: the password, and the challenge opened (only the approving device's private key can). Then the new
+//    computer is approved and the other members' apps hand it the keys.
+const approvals = new Map() // approvalId -> { accountId, pendingId, approverId, challengeHash, expires, tries }
+const approvalFailures = new Map() // accountId -> [times of wrong codes]
+const APPROVAL_FAILS = 8
+
+app.post('/api/devices/approvals', requireAuth, deviceLimiter, (req, res) => {
+  const accountId = req.account.sub
+  const now = Date.now()
+  const fails = (approvalFailures.get(accountId) || []).filter((t) => now - t < 10 * 60 * 1000)
+  if (fails.length >= APPROVAL_FAILS) {
+    return res.status(429).json({ error: 'Too many wrong codes. Wait a few minutes and ask the new computer for a new one.', reason: 'too_many_attempts' })
+  }
+  const { code, approverDeviceId } = req.body || {}
+  const approver = Number.isInteger(approverDeviceId)
+    ? db.prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NOT NULL').get(approverDeviceId, accountId)
+    : null
+  if (!approver) return res.status(400).json({ error: 'approverDeviceId must be one of your approved computers' })
+  const normalized = normalizePairingCode(code)
+  const pending = normalized
+    ? db
+        .prepare('SELECT * FROM device_keys WHERE account_id = ? AND revoked_at IS NULL AND approved_at IS NULL AND pairing_hash = ? AND pairing_expires > ?')
+        .get(accountId, hashPairingCode(normalized), now)
+    : null
+  if (!pending) {
+    fails.push(now)
+    approvalFailures.set(accountId, fails)
+    return res.status(404).json({ error: 'That code is wrong or has run out. Ask the new computer for a new one.', reason: 'bad_code' })
+  }
+  const approvalId = randomBytes(16).toString('hex')
+  const challenge = randomBytes(32)
+  approvals.set(approvalId, {
+    accountId,
+    pendingId: pending.id,
+    approverId: approver.id,
+    challengeHash: sha256hex(challenge),
+    expires: now + APPROVAL_MINUTES * 60 * 1000,
+    tries: 0
+  })
+  res.json({
+    approvalId,
+    challenge: sealToDevice(approver.public_key, challenge, `rushlight-approval-v1|${approvalId}|${approver.id}`),
+    device: { id: pending.id, label: pending.label, createdAt: pending.created_at }
+  })
+})
+
+app.post('/api/devices/approvals/:approvalId/confirm', accountSecretsLimiter, requireAuth, asyncHandler(async (req, res) => {
+  const accountId = req.account.sub
+  const approval = approvals.get(req.params.approvalId)
+  if (!approval || approval.accountId !== accountId || approval.expires < Date.now()) {
+    approvals.delete(req.params.approvalId)
+    return res.status(404).json({ error: 'That approval has run out. Enter the code again.', reason: 'approval_expired' })
+  }
+  if (++approval.tries > 3) {
+    approvals.delete(req.params.approvalId)
+    return res.status(429).json({ error: 'Too many tries. Enter the code again.', reason: 'too_many_attempts' })
+  }
+  const { password, proof } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const me = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(accountId)
+  if (!me || !(await verifyPassword(password, me.password_hash))) return res.status(401).json({ error: 'Incorrect password' })
+  // the challenge opened with the approving device's private key: proof that an approved computer is doing this
+  const proven = typeof proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(proof) && sha256hex(Buffer.from(proof, 'base64url')) === approval.challengeHash
+  if (!proven) return res.status(403).json({ error: 'This computer could not prove it is one of your approved computers.', reason: 'bad_proof' })
+  const approver = db.prepare('SELECT 1 FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NOT NULL').get(approval.approverId, accountId)
+  const pending = db.prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NULL').get(approval.pendingId, accountId)
+  approvals.delete(req.params.approvalId)
+  if (!approver || !pending) return res.status(409).json({ error: 'That computer is no longer waiting. Start again.', reason: 'gone' })
+  db.prepare('UPDATE device_keys SET approved_at = ?, approved_by = ?, pairing_hash = NULL, pairing_expires = NULL WHERE id = ?').run(Date.now(), approval.approverId, pending.id)
+  res.json({ approved: true, device: serializeDevice(db.prepare('SELECT * FROM device_keys WHERE id = ?').get(pending.id)) })
+}))
 
 app.get('/api/devices', requireAuth, (req, res) => {
   res.json({ devices: activeDevices(req.account.sub).map(serializeDevice) })
@@ -2216,6 +2336,8 @@ app.delete('/api/devices/:id', requireAuth, deviceLimiter, (req, res) => {
   if (!device) return res.status(404).json({ error: 'Not found' })
   db.transaction(() => {
     db.prepare('UPDATE device_keys SET revoked_at = ? WHERE id = ?').run(Date.now(), device.id)
+    // a computer still waiting for approval never held a key: nothing to take back and no new key needed
+    if (!device.approved_at) return
     db.prepare('DELETE FROM key_envelopes WHERE recipient_device_id = ?').run(device.id)
     const memberships = db.prepare('SELECT server_id FROM server_members WHERE account_id = ?').all(req.account.sub)
     for (const m of memberships) markRekeyNeeded(m.server_id)
@@ -2231,7 +2353,7 @@ function memberDevices(serverId) {
        FROM device_keys d
        JOIN server_members sm ON sm.account_id = d.account_id AND sm.server_id = ?
        JOIN accounts a ON a.id = d.account_id
-       WHERE d.revoked_at IS NULL ORDER BY d.id`
+       WHERE d.revoked_at IS NULL AND d.approved_at IS NOT NULL ORDER BY d.id`
     )
     .all(serverId)
 }
@@ -2259,7 +2381,7 @@ function readEnvelopeBody(req, serverId) {
   const body = req.body || {}
   const senderId = Number(body.senderDeviceId)
   const device = Number.isInteger(senderId)
-    ? db.prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL').get(senderId, req.account.sub)
+    ? db.prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NOT NULL').get(senderId, req.account.sub)
     : null
   if (!device) return { error: 'senderDeviceId must be one of your devices' }
   if (!Array.isArray(body.envelopes) || body.envelopes.length === 0 || body.envelopes.length > MAX_ENVELOPES_PER_CALL) {
@@ -2916,7 +3038,7 @@ app.post('/api/servers/:id/encryption/enable', accountSecretsLimiter, requireAut
     return res.status(426).json({ error: 'Update Rushlight before switching encryption on.', reason: 'client_too_old', minClient: MIN_E2EE_CLIENT })
   }
   // The first key is made by an admin's app, which needs a device of its own to wrap it to.
-  const hasDevice = db.prepare('SELECT 1 FROM device_keys WHERE account_id = ? AND revoked_at IS NULL').get(req.account.sub)
+  const hasDevice = db.prepare('SELECT 1 FROM device_keys WHERE account_id = ? AND revoked_at IS NULL AND approved_at IS NOT NULL').get(req.account.sub)
   if (!hasDevice) return res.status(409).json({ error: 'This computer has no encryption key yet. Open the server once more and try again.', reason: 'owner_needs_device' })
   const before = encryptionPreview(serverId)
   if (before.plainMessages > 0 && wipe !== true) {
@@ -3134,6 +3256,8 @@ const wiped = wipeAllEphemeralOnStartup()
 function runRetention() {
   try {
     const n = purgeExpiredHistory()
+    // a computer that asked for approval a week ago and never got it holds no keys; forget it
+    db.prepare('DELETE FROM device_keys WHERE approved_at IS NULL AND created_at < ?').run(Date.now() - PENDING_KEEP_MS)
     if (n) console.log(`Removed ${n} message(s) older than their server's history window`)
   } catch (err) {
     console.error('retention cleanup:', err)

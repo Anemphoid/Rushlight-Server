@@ -1,6 +1,6 @@
 // End-to-end encryption helpers. The server never holds a key it could read a message with: it checks
 // that what it is handed has the right shape, stores it, and hands it back. Nothing here decrypts.
-import { createECDH } from 'node:crypto'
+import { createECDH, createHash, randomBytes, hkdfSync, createCipheriv } from 'node:crypto'
 
 // The oldest client that may use a server with encryption on. Older ones would show ciphertext as
 // text. The client sends its version in X-Rushlight-Client. Overridable for tests.
@@ -102,4 +102,46 @@ export function cleanCodeSecret(value) {
   if (typeof value !== 'string' || value.length > 1024) return null
   const m = CODE_SECRET.exec(value)
   return m && Number(m[1]) >= 1 ? { value, epoch: Number(m[1]) } : null
+}
+
+// --- Approving a new computer ---
+// A computer that signs in to an account that already has an approved device does not get keys until one of the
+// account's approved computers vouches for it. The new computer shows a pairing code (valid 5 minutes); typed into an
+// approved computer with the password, that computer first has to prove it holds an approved device key: the server
+// seals a random challenge to that device's public key and only the private key can open it. A stolen password and
+// session on a new computer therefore cannot approve itself: its own code and password are not enough.
+export const PAIRING_CODE_MINUTES = 5
+export const APPROVAL_MINUTES = 2
+const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+
+// Eight Crockford base32 characters (40 bits), shown as XXXX-XXXX.
+export function newPairingCode() {
+  const bytes = randomBytes(8)
+  let out = ''
+  for (let i = 0; i < 8; i++) out += CROCKFORD[bytes[i] & 31]
+  return `${out.slice(0, 4)}-${out.slice(4)}`
+}
+
+// What a person types is read the forgiving way (case, dashes, spaces; O as 0, I and L as 1) and then compared as a hash.
+export function normalizePairingCode(value) {
+  if (typeof value !== 'string') return null
+  const text = value.toUpperCase().replace(/[\s-]/g, '').replace(/O/g, '0').replace(/[IL]/g, '1')
+  return /^[0-9A-HJKMNP-TV-Z]{8}$/.test(text) ? text : null
+}
+export const hashPairingCode = (normalized) => createHash('sha256').update('rushlight-pairing-v1|' + normalized).digest('hex')
+
+export const sha256hex = (bytes) => createHash('sha256').update(bytes).digest('hex')
+
+// ECIES to a device's public key: ephemeral ECDH, HKDF-SHA256 and AES-256-GCM, with `info` bound as key info and AAD.
+// Output (base64url): the 65 byte ephemeral public key, a 12 byte nonce, then the ciphertext and its 16 byte tag.
+export function sealToDevice(publicKey, plaintext, info) {
+  const eph = createECDH('prime256v1')
+  eph.generateKeys()
+  const secret = eph.computeSecret(Buffer.from(publicKey, 'base64url'))
+  const key = Buffer.from(hkdfSync('sha256', secret, Buffer.alloc(0), Buffer.from(info), 32))
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  cipher.setAAD(Buffer.from(info))
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  return Buffer.concat([eph.getPublicKey(), iv, ct, cipher.getAuthTag()]).toString('base64url')
 }

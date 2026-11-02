@@ -353,6 +353,23 @@ export const migrations = [
         ALTER TABLE rooms ADD COLUMN jellybox_open INTEGER NOT NULL DEFAULT 0;
       `)
     }
+  },
+  {
+    id: 17,
+    name: 'a new computer has to be approved before it is handed any keys',
+    up(db) {
+      // approved_at: NULL = a computer waiting for approval (it gets no keys); every device that exists now was
+      // handed keys under the old rules, so it counts as approved from the day it was added. approved_by: the device
+      // that vouched for it (NULL for an account's first). pairing_hash / pairing_expires: the 5 minute code its owner
+      // reads off its screen. Only adds columns.
+      db.exec(`
+        ALTER TABLE device_keys ADD COLUMN approved_at INTEGER;
+        ALTER TABLE device_keys ADD COLUMN approved_by INTEGER;
+        ALTER TABLE device_keys ADD COLUMN pairing_hash TEXT;
+        ALTER TABLE device_keys ADD COLUMN pairing_expires INTEGER;
+        UPDATE device_keys SET approved_at = created_at;
+      `)
+    }
   }
 ]
 
