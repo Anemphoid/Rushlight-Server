@@ -5,6 +5,7 @@ import { Jellyfin, JellyfinError, checkAddress } from './jellyfin.js'
 import { openToken, sealToken } from './secret.js'
 import { makeSink } from './sinks.js'
 import { Player } from './player.js'
+import { bestMatch } from './match.js'
 import { BOT_NAME, describe, fmtTime, say } from './voice.js'
 
 export { BOT_NAME }
@@ -192,11 +193,6 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
     return { ok: true, text }
   }
 
-  function bestMatch(results, q) {
-    const lower = q.toLowerCase()
-    return results.find((r) => r.title.toLowerCase() === lower) || results[0]
-  }
-
   // --- commands typed in chat ---
   // ctx: { serverId, type, spaceId, spaceMode, account: { id, name }, isAdmin }
   // Returns the reply text, or null when the message isn't a Jellybox command at all.
@@ -236,7 +232,9 @@ export function createMusic({ db, livekit, postBotMessage, isOccupied, hasPresen
             result = s.results[Number(arg) - 1]
             if (!result) return say.badNumber(s.results.length)
           } else {
-            const results = await found.jf.search(arg, 8)
+            // a wider net than /search shows: Jellyfin can rank the title that was typed below titles that only
+            // contain a word of it
+            const results = await found.jf.search(arg, 30)
             if (results.length === 0) return say.nothingFound(arg)
             result = bestMatch(results, arg)
           }
