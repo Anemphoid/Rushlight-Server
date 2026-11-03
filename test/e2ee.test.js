@@ -43,10 +43,15 @@ const wrapped = () => randomBytes(80).toString('base64url') // looks like a wrap
 const sealed = (epoch, text = 'hello') =>
   `rl1.${epoch}.${randomBytes(12).toString('base64url')}.${randomBytes(Buffer.byteLength(text) + 16).toString('base64url')}`
 
+// A computer of the account that is already approved (these tests are about keys and envelopes; the gate that a second
+// computer has to pass is in e2ee-gate.test.js).
 async function device(account, label = 'laptop') {
   const r = await call('POST', '/api/devices', { publicKey: newPublicKey(), label }, account.token)
   assert.equal(r.status, 200, JSON.stringify(r.data))
-  return r.data
+  const db = new Database(srv.dbPath)
+  db.prepare('UPDATE device_keys SET approved_at = created_at WHERE id = ?').run(r.data.id)
+  db.close()
+  return { ...r.data, approved: true }
 }
 
 function setServerFlags(id, sql, ...args) {
@@ -436,7 +441,9 @@ test('nothing in the server can turn encryption on, read a wrapped key or hand a
   // imports nothing that could decrypt: only ECDH validation of public keys
   const { readFileSync } = await import('node:fs')
   const src = readFileSync(new URL('../src/e2ee.js', import.meta.url), 'utf8')
-  assert.ok(!/createDecipher|createCipher|privateDecrypt|subtle\.decrypt/.test(src))
+  // (it does ENCRYPT one thing: the challenge for approving a new computer, sealed to a device's public key, with an
+  // ephemeral key it throws away; createCipheriv is allowed for that, nothing that decrypts is)
+  assert.ok(!/createDecipher|createCipher\b|privateDecrypt|subtle\.decrypt/.test(src))
 })
 
 async function until(fn, ms = 8000) {

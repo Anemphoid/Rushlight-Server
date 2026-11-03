@@ -499,6 +499,17 @@ design is in the Rushlight roadmap. What the server does and does not do:
   (chat stays encrypted); the tree shows `jellyboxOpen` for every channel and room, the room's chat gets a plain bot
   notice naming the admin, and switching it off stops the bot and puts the encryption back. Other rooms are unaffected.
   Otherwise the server and LiveKit only ever see encrypted frames.
+- **A new computer has to be approved.** An account's first computer (device) is approved at once. Any later one
+  (`POST /api/devices`) is stored as waiting (`approved: false`) and gets a pairing code, `XXXX-XXXX`, valid for 5
+  minutes, returned once to that computer; `POST /api/devices/:id/pairing-code` renews it. A waiting computer is not in the
+  member device list, so no key is wrapped to it and it cannot hand keys out, and removing it asks for no new key. To approve it,
+  an approved computer of the same account calls `POST /api/devices/approvals` with the code and its own device id. The
+  answer names the new computer and carries a random challenge sealed (ECIES to the approving device's public key) so only that
+  device's private key can open it. `POST /api/devices/approvals/:id/confirm` with the password and the opened challenge then
+  approves it. So a stolen password and session on a new computer cannot approve itself: it holds neither an approved device
+  key nor the old computer. Wrong codes are counted (8 in 10 minutes, then 429), an approval lasts 2 minutes and 3 tries. A
+  computer waiting for more than 7 days is forgotten. Migration 17 counts every device that exists as approved. When an
+  account has no approved computer left, a new one waits with nobody to approve it (the recovery key path, a later step).
 - **Switching it on.** `GET /api/servers/:id/encryption` (owner only) previews: how many plain messages and pictures
   would be wiped, how many members have a device already (`membersReady`, the rest cannot use the server until they
   update). `POST /api/servers/:id/encryption/enable` (owner, with their password, from an app of `E2EE_MIN_CLIENT` or
