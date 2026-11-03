@@ -510,6 +510,17 @@ design is in the Rushlight roadmap. What the server does and does not do:
   key nor the old computer. Wrong codes are counted (8 in 10 minutes, then 429), an approval lasts 2 minutes and 3 tries. A
   computer waiting for more than 7 days is forgotten. Migration 17 counts every device that exists as approved. When an
   account has no approved computer left, a new one waits with nobody to approve it (the recovery key path, a later step).
+- **Keyring backup (migration 18).** The person's server keys, sealed on their own computer under a key made from their 12
+  recovery words, are kept as an opaque blob: `GET /api/me/keyring` (`?blob=1` for the blob itself), `PUT /api/me/keyring`
+  with the blob, `proofHash` (SHA-256 of a second value made from the same words) and `baseVersion` (409 `version_conflict`
+  when stale). The last 3 blobs are kept so a bad overwrite can be undone. Writing the blob needs only the session; **setting
+  or changing the proof also needs the recovery key itself** (`recoveryKey` in the body, checked against the stored hash), so a
+  session, or a session and the password, cannot plant a proof of its own. A computer that is waiting for approval and has no
+  other computer to ask approves itself with `POST /api/devices/:id/recover { proof }`: the server compares the hash of the
+  proof, so the words are never sent for this; 8 wrong tries in 10 minutes and it waits. A password reset keeps the devices and
+  the backup (a new recovery key is issued, and the app seals the backup again under it). The server cannot open the blob; what
+  it does see are the words, once, when a proof is first set or changed (it generated them, and it checks them on a reset), so
+  this protects against a stolen database or backup, not against a server changed to record words.
 - **Switching it on.** `GET /api/servers/:id/encryption` (owner only) previews: how many plain messages and pictures
   would be wiped, how many members have a device already (`membersReady`, the rest cannot use the server until they
   update). `POST /api/servers/:id/encryption/enable` (owner, with their password, from an app of `E2EE_MIN_CLIENT` or

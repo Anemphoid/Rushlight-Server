@@ -145,3 +145,12 @@ export function sealToDevice(publicKey, plaintext, info) {
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()])
   return Buffer.concat([eph.getPublicKey(), iv, ct, cipher.getAuthTag()]).toString('base64url')
 }
+
+// --- Keyring backup ---
+// The person's server keys, sealed on their computer under a key made from their recovery words: rlk1.<nonce>.<ciphertext>.
+// The server checks the shape and the size and stores it blind.
+export const MAX_KEYRING = 1_000_000
+const KEYRING = /^rlk1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22,}$/
+export const cleanKeyring = (value) => (typeof value === 'string' && value.length <= MAX_KEYRING && KEYRING.test(value) ? value : null)
+export const cleanProofHash = (value) => (typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null)
+export const KEYRING_HISTORY = 3
