@@ -2186,7 +2186,8 @@ function serializeDevice(d) {
     publicKey: d.public_key,
     createdAt: d.created_at,
     approved: !!d.approved_at,
-    ...(d.approved_at ? {} : { pairingExpiresAt: d.pairing_expires && d.pairing_expires > Date.now() ? d.pairing_expires : null })
+    // how long the code has left, as a length of time as well: a computer whose clock is a few minutes off still counts it right
+    ...(d.approved_at ? {} : d.pairing_expires && d.pairing_expires > Date.now() ? { pairingExpiresAt: d.pairing_expires, pairingExpiresInMs: d.pairing_expires - Date.now() } : { pairingExpiresAt: null, pairingExpiresInMs: 0 })
   }
 }
 
@@ -2235,7 +2236,7 @@ app.post('/api/devices', requireAuth, deviceLimiter, (req, res) => {
     .prepare('INSERT INTO device_keys (account_id, public_key, label, created_at, approved_at, pairing_hash, pairing_expires) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(req.account.sub, publicKey, label, now, everHad ? null : now, pairing ? pairing.hash : null, pairing ? pairing.expires : null)
   const row = db.prepare('SELECT * FROM device_keys WHERE id = ?').get(info.lastInsertRowid)
-  res.json({ ...serializeDevice(row), created: true, ...(pairing ? { pairing: { code: pairing.code, expiresAt: pairing.expires } } : {}) })
+  res.json({ ...serializeDevice(row), created: true, ...(pairing ? { pairing: { code: pairing.code, expiresAt: pairing.expires, expiresInMs: pairing.expires - Date.now() } } : {}) })
 })
 
 // A waiting computer asks for a fresh code (the old one runs out after 5 minutes). Only the code is new.
@@ -2246,7 +2247,7 @@ app.post('/api/devices/:id/pairing-code', requireAuth, deviceLimiter, (req, res)
   if (!device) return res.status(404).json({ error: 'That computer is not waiting for approval' })
   const pairing = newPairing()
   db.prepare('UPDATE device_keys SET pairing_hash = ?, pairing_expires = ? WHERE id = ?').run(pairing.hash, pairing.expires, device.id)
-  res.json({ pairing: { code: pairing.code, expiresAt: pairing.expires } })
+  res.json({ pairing: { code: pairing.code, expiresAt: pairing.expires, expiresInMs: pairing.expires - Date.now() } })
 })
 
 // --- Approving a new computer (two steps, from a computer that is already approved) ---

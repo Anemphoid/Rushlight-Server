@@ -82,6 +82,7 @@ test('an account\'s first computer is approved at once; a second one waits and i
   assert.equal(second.approved, false)
   assert.match(second.pairing.code, /^[0-9A-Z]{4}-[0-9A-Z]{4}$/)
   assert.ok(second.pairing.expiresAt > Date.now() + 4 * 60 * 1000 && second.pairing.expiresAt <= Date.now() + 5 * 60 * 1000 + 1000)
+  assert.ok(second.pairing.expiresInMs > 4 * 60 * 1000 && second.pairing.expiresInMs <= 5 * 60 * 1000, 'also as a length of time, for computers whose clock is off')
   const mine = (await call('GET', '/api/devices', undefined, me.token)).data.devices
   assert.deepEqual(mine.map((d) => d.approved), [true, false])
   assert.equal(JSON.stringify(mine).includes(second.pairing.code), false, 'the code is shown once, to the new computer')
