@@ -12,7 +12,7 @@ member; the owner is an admin.
 
 | Data | Where | Readable by the server? |
 | --- | --- | --- |
-| Username, password hash (bcrypt), recovery key hash | `accounts` | Names yes. Passwords and the recovery key no: only hashes. |
+| Username, password hash (bcrypt), recovery key verifier | `accounts` | Names yes. Passwords no: only a hash. The recovery key: since v0.22.0 the app makes the 12 words and the server holds only a hash of a proof derived from them, so it never sees the words. A key made by an older server is a hash of the words (the server saw them once, at sign-up) until the person makes a new one. |
 | When an account was last seen (v0.21.0) | `accounts.last_seen_at` | Yes. Shown only to the admins of a server the person owns, and only for the owner. |
 | Avatar image | `accounts` | Yes. See finding 1. |
 | Chat text and pictures | `messages`, `message_images` | Plain in a server that is not encrypted. In an encrypted server only scrambled text and bytes. |
@@ -29,7 +29,7 @@ member; the owner is an admin.
 | --- | --- | --- | --- | --- | --- |
 | That the server is up (`/api/health`) | yes | yes | yes | yes | yes |
 | Whether an invite code is good, and its server id (`/api/code-check`) | yes (rate limited) | yes | yes | yes | yes |
-| An account's avatar by id (`/api/avatars/:id`) | **yes** | yes | yes | yes | yes |
+| An account's avatar by id (`/api/avatars/:id`) | no | people of the server they came in to | the person and people who share a server | same | same |
 | Server name, channel tree, who is present | no | own space only | yes | yes | yes |
 | Member list (names, roles, mute, when they joined, access end) | no | no | yes | yes | yes |
 | Messages and pictures of a space | no | no | yes, if a member of that server | yes | yes |
@@ -57,11 +57,17 @@ Nobody can reset, take over or read the account of another person.
 
 ## Findings
 
-1. **Avatars are public by account id.** `/api/avatars/:accountId` needs no sign-in, and ids count up from 1, so anyone can
-   download every avatar and learn how many accounts exist. A picture and a number, no names. Closing it means the app fetching
-   avatars with its token (a client and a server change). Owner decision: leave and say so in the policy, or close it before 1.0.
+1. **Avatars were public by account id.** Closed in v0.22.0: `/api/avatars/:id` needs a sign-in (an account or a guest's token) and
+   answers only for the person themself and people who share a server with them (a guest: the server they came in to). Everyone
+   else gets the same answer as for an account with no picture, so ids cannot be walked and accounts cannot be counted. The app
+   fetches avatars with its token. Tested in `test/recovery-app-made.test.js`.
 2. **The error log wrote the request path with its query string and the whole error object.** Fixed: only the method, the path
    without its query, the error name and code, and the first lines of the stack are logged, and `test/log-privacy.test.js` fails if
    a message, picture, password, token, invite or recovery word reaches the log.
 3. In a server that is not encrypted the owner of the machine can read chat text in the database. That is what "not encrypted" means;
    the policy says it plainly, and turning encryption on wipes the old text first.
+4. **The server used to see the recovery words once** (at sign-up and at each reset). Closed in v0.22.0 for every key the app makes:
+   see the first table. Accounts whose key an older server made keep working, and move to an app-made key when the person makes
+   a new one (Settings > Account); until then the old limit stands for them. The reset route tells an app that an account's key is
+   of the older kind (`reason: legacy_key`) so the app can send the words in that one case; usernames are not secret (sign-up says
+   when one is taken), and nothing else is revealed.

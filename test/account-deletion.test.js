@@ -173,11 +173,12 @@ test("the avatar goes with the account, and the account's rooms and presence are
   // a tiny valid PNG as the avatar
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
   assert.equal((await srv.call('POST', '/api/me/avatar', { image: png, mime: 'image/png' }, a.token)).status, 200)
-  assert.equal((await fetch(`${srv.url}/api/avatars/${a.id}`)).status, 200)
+  const avatar = (token) => fetch(`${srv.url}/api/avatars/${a.id}`, { headers: token ? { authorization: 'Bearer ' + token } : {} })
+  assert.equal((await avatar(a.token)).status, 200)
   await srv.call('POST', '/api/presence', { type: 'channel', id: w.ch.id }, a.token)
   fake.reset()
   assert.equal((await del(a)).status, 200)
-  assert.equal((await fetch(`${srv.url}/api/avatars/${a.id}`)).status, 404)
+  assert.equal((await avatar(w.owner.token)).status, 404)
   assert.ok(fake.removals().some((r) => r.identity === `acct-${a.id}`), 'LiveKit was never told to drop them')
   const here = (await srv.call('GET', `/api/servers/${w.s.id}`, undefined, w.owner.token)).data.presence
   assert.deepEqual(Object.values(here).flat().filter((p) => p.id === a.id), [])
