@@ -3501,7 +3501,9 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err)
   if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The request body was not valid JSON' })
   if (err.type === 'entity.too.large') return res.status(413).json({ error: 'The request was too large' })
-  console.error(`${req.method} ${req.originalUrl}:`, err)
+  // Only what is needed to find the bug: never the error object itself (a body-parser error carries the request body) and
+  // never the query string.
+  console.error(`${req.method} ${req.path}:`, err && err.name, err && err.code, err && err.stack ? String(err.stack).split('\n').slice(0, 6).join('\n') : '')
   res.status(500).json({ error: 'Something went wrong on the server' })
 })
 
