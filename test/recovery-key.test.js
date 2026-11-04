@@ -276,7 +276,8 @@ test('every route that touches a password or key is one of the self-service rout
     .map((m) => m[1])
     .filter((p) => /password|recover/i.test(p))
     .sort()
-  assert.deepEqual(found, ['/api/me/password', '/api/me/recovery-key', '/api/me/recovery-key/ack', '/api/recover'])
+  // (/api/devices/:id/recover is the owner's own waiting computer proving it knows the recovery words; see e2ee-keyring.test.js)
+  assert.deepEqual(found, ['/api/devices/:id/recover', '/api/me/password', '/api/me/recovery-key', '/api/me/recovery-key/ack', '/api/recover'])
 })
 
 test('tokens issued before sessions could end still work, and a token for a missing account does not', async () => {

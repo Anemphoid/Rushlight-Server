@@ -2,7 +2,7 @@ import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import rateLimit from 'express-rate-limit'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { db } from './db.js'
 import { generateCode } from './wordlist.js'
@@ -27,7 +27,10 @@ import {
   normalizePairingCode,
   hashPairingCode,
   sha256hex,
-  sealToDevice
+  sealToDevice,
+  cleanKeyring,
+  cleanProofHash,
+  KEYRING_HISTORY
 } from './e2ee.js'
 import {
   hashPassword,
@@ -1001,6 +1004,7 @@ app.delete('/api/me', accountSecretsLimiter, requireAuth, asyncHandler(async (re
        WHERE author_account_id = ?`
     ).run(accountId)
     for (const m of memberships) forgetMemberKeys(m.server_id, accountId)
+    db.prepare('DELETE FROM keyring_history WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM key_envelopes WHERE recipient_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
     db.prepare('UPDATE key_envelopes SET sender_device_id = NULL WHERE sender_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
     db.prepare('DELETE FROM device_keys WHERE account_id = ?').run(accountId)
@@ -2248,6 +2252,90 @@ app.post('/api/devices/:id/pairing-code', requireAuth, deviceLimiter, (req, res)
   const pairing = newPairing()
   db.prepare('UPDATE device_keys SET pairing_hash = ?, pairing_expires = ? WHERE id = ?').run(pairing.hash, pairing.expires, device.id)
   res.json({ pairing: { code: pairing.code, expiresAt: pairing.expires, expiresInMs: pairing.expires - Date.now() } })
+})
+
+// --- Keyring backup ---
+// The person's server keys, sealed on their computer under a key made from their 12 recovery words. The server keeps the
+// sealed blob and the last few before it, and a hash of a second value made from the same words (the proof). It never sees
+// the words in these routes except to check them when the proof is first set or changed, and it cannot open the blob.
+// Reading needs only the session: the blob is useless without the words. Writing the blob needs the session and the
+// current version; setting or changing the proof also needs the recovery key itself, so nobody who only has a session
+// (or a session and the password) can plant a proof of their own and walk a new computer past the approval.
+app.get('/api/me/keyring', requireAuth, (req, res) => {
+  const a = db.prepare('SELECT keyring_blob, keyring_version, keyring_updated_at FROM accounts WHERE id = ?').get(req.account.sub)
+  const exists = !!(a && a.keyring_blob)
+  res.json({
+    exists,
+    version: a ? a.keyring_version : 0,
+    updatedAt: exists ? a.keyring_updated_at : null,
+    ...(exists && req.query.blob === '1' ? { blob: a.keyring_blob } : {})
+  })
+})
+
+app.put('/api/me/keyring', accountSecretsLimiter, requireAuth, (req, res) => {
+  const accountId = req.account.sub
+  const body = req.body || {}
+  const blob = cleanKeyring(body.blob)
+  const proofHash = cleanProofHash(body.proofHash)
+  if (!blob) return res.status(400).json({ error: 'That is not a keyring' })
+  if (!proofHash) return res.status(400).json({ error: 'proofHash is required' })
+  const account = db.prepare('SELECT recovery_key_hash, keyring_blob, keyring_proof_hash, keyring_version FROM accounts WHERE id = ?').get(accountId)
+  if (!account) return res.status(404).json({ error: 'Not found' })
+  if (!Number.isInteger(body.baseVersion) || body.baseVersion !== account.keyring_version) {
+    return res.status(409).json({ error: 'The backup changed since you read it', reason: 'version_conflict', version: account.keyring_version })
+  }
+  // A new or different proof must come with the recovery key it was made from.
+  if (account.keyring_proof_hash !== proofHash) {
+    if (!account.recovery_key_hash) return res.status(409).json({ error: 'Confirm your recovery key first', reason: 'no_recovery_key' })
+    if (!recoveryKeyMatches(body.recoveryKey, account.recovery_key_hash)) {
+      return res.status(401).json({ error: "That isn't your recovery key", reason: 'bad_recovery_key' })
+    }
+  }
+  const now = Date.now()
+  const version = account.keyring_version + 1
+  db.transaction(() => {
+    if (account.keyring_blob) {
+      db.prepare('INSERT INTO keyring_history (account_id, version, blob, proof_hash, created_at) VALUES (?, ?, ?, ?, ?)').run(
+        accountId, account.keyring_version, account.keyring_blob, account.keyring_proof_hash, now
+      )
+      db.prepare(
+        `DELETE FROM keyring_history WHERE account_id = ? AND id NOT IN (
+           SELECT id FROM keyring_history WHERE account_id = ? ORDER BY id DESC LIMIT ?)`
+      ).run(accountId, accountId, KEYRING_HISTORY)
+    }
+    db.prepare('UPDATE accounts SET keyring_blob = ?, keyring_proof_hash = ?, keyring_version = ?, keyring_updated_at = ? WHERE id = ?').run(
+      blob, proofHash, version, now, accountId
+    )
+  })()
+  res.json({ version, updatedAt: now })
+})
+
+// A computer that is waiting for approval and has no other computer to ask can approve itself by proving it knows the
+// recovery words, without sending them: the proof is a value made from them, checked against the stored hash.
+const recoverFailures = new Map() // accountId -> [times]
+app.post('/api/devices/:id/recover', requireAuth, deviceLimiter, (req, res) => {
+  const accountId = req.account.sub
+  const now = Date.now()
+  const fails = (recoverFailures.get(accountId) || []).filter((t) => now - t < 10 * 60 * 1000)
+  if (fails.length >= APPROVAL_FAILS) {
+    return res.status(429).json({ error: 'Too many wrong tries. Wait a few minutes.', reason: 'too_many_attempts' })
+  }
+  const device = db
+    .prepare('SELECT * FROM device_keys WHERE id = ? AND account_id = ? AND revoked_at IS NULL AND approved_at IS NULL')
+    .get(Number(req.params.id), accountId)
+  if (!device) return res.status(404).json({ error: 'That computer is not waiting for approval' })
+  const account = db.prepare('SELECT keyring_proof_hash FROM accounts WHERE id = ?').get(accountId)
+  const proof = req.body && req.body.proof
+  const given = typeof proof === 'string' && /^[A-Za-z0-9_-]{43}$/.test(proof) ? Buffer.from(sha256hex(Buffer.from(proof, 'base64url')), 'hex') : Buffer.alloc(32)
+  const want = Buffer.from(account && account.keyring_proof_hash ? account.keyring_proof_hash : '0'.repeat(64), 'hex')
+  const ok = !!(account && account.keyring_proof_hash) && typeof proof === 'string' && timingSafeEqual(given, want)
+  if (!ok) {
+    fails.push(now)
+    recoverFailures.set(accountId, fails)
+    return res.status(401).json({ error: "That recovery key doesn't match this account's backup", reason: 'bad_proof' })
+  }
+  db.prepare('UPDATE device_keys SET approved_at = ?, approved_by = NULL, pairing_hash = NULL, pairing_expires = NULL WHERE id = ?').run(now, device.id)
+  res.json({ approved: true, device: serializeDevice(db.prepare('SELECT * FROM device_keys WHERE id = ?').get(device.id)) })
 })
 
 // --- Approving a new computer (two steps, from a computer that is already approved) ---

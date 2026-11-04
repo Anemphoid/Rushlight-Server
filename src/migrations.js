@@ -370,6 +370,31 @@ export const migrations = [
         UPDATE device_keys SET approved_at = created_at;
       `)
     }
+  },
+  {
+    id: 18,
+    name: 'a keyring backup that only the recovery key can open',
+    up(db) {
+      // keyring_blob: the account's server keys, sealed on the person's computer under a key made from their 12 recovery
+      // words; the server cannot open it. keyring_proof_hash: SHA-256 of a second value made from the same words (never the
+      // words themselves), which lets a new computer approve itself by proving it knows them. keyring_version is a
+      // compare-and-swap counter. keyring_history keeps the last few blobs so a bad overwrite can be undone. Only adds.
+      db.exec(`
+        ALTER TABLE accounts ADD COLUMN keyring_blob TEXT;
+        ALTER TABLE accounts ADD COLUMN keyring_proof_hash TEXT;
+        ALTER TABLE accounts ADD COLUMN keyring_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE accounts ADD COLUMN keyring_updated_at INTEGER;
+        CREATE TABLE IF NOT EXISTS keyring_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          account_id INTEGER NOT NULL REFERENCES accounts(id),
+          version INTEGER NOT NULL,
+          blob TEXT NOT NULL,
+          proof_hash TEXT,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_keyring_history_account ON keyring_history(account_id);
+      `)
+    }
   }
 ]
 
