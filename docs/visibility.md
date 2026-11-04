@@ -12,7 +12,7 @@ member; the owner is an admin.
 
 | Data | Where | Readable by the server? |
 | --- | --- | --- |
-| Username, password hash (scrypt), recovery key hash | `accounts` | Names yes. Passwords and the recovery key no: only hashes. |
+| Username, password hash (bcrypt), recovery key hash | `accounts` | Names yes. Passwords and the recovery key no: only hashes. |
 | When an account was last seen (v0.21.0) | `accounts.last_seen_at` | Yes. Shown only to the admins of a server the person owns, and only for the owner. |
 | Avatar image | `accounts` | Yes. See finding 1. |
 | Chat text and pictures | `messages`, `message_images` | Plain in a server that is not encrypted. In an encrypted server only scrambled text and bytes. |
@@ -20,7 +20,7 @@ member; the owner is an admin.
 | Device public keys, a computer label (operating system only) | `device_keys` | Yes, they are public. |
 | Server membership, roles, bans, join codes (the visible half) | several | Yes. The secret half of an invite in an encrypted server is never sent to the server in the clear. |
 | Presence (who is in which space now) | memory | Yes; it is not written to disk. |
-| Jellyfin address and key (if the owner links one) | `music_links` | The key is encrypted at rest with a key from `JWT_SECRET`. |
+| Jellyfin address and key (if the owner links one) | `server_music` | The key is encrypted at rest with a key from `JWT_SECRET`. |
 | IP addresses | memory only (rate limits) | Not stored and not logged. |
 
 ## What each role can read
