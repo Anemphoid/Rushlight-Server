@@ -8,7 +8,7 @@ import { db } from './db.js'
 import { generateCode } from './wordlist.js'
 import { createMusic, BOT_NAME, JellyfinError, isItemId } from './music/index.js'
 import { inspectImage, ALLOWED_IMAGE_MIME } from './images.js'
-import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches } from './recoverykey.js'
+import { generateRecoveryKey, hashRecoveryKey, recoveryKeyMatches, recoveryMatches, isProofKey, storedProofKey } from './recoverykey.js'
 import {
   MIN_E2EE_CLIENT,
   MAX_ACTIVE_DEVICES,
@@ -793,13 +793,25 @@ function sessionResponse(account, extra = {}) {
     avatarUpdatedAt: account.avatar_updated_at || null,
     // false until the person has confirmed they saved a recovery key
     recoveryKeyAcked: !!account.recovery_key_hash,
+    recoveryKeyBy: keyMaker(account.recovery_key_hash),
     ...extra
   }
 }
 
+// Who made the working recovery key: the person's app ('app'), an older server ('server'), or nobody yet (null).
+function keyMaker(stored) {
+  return !stored ? null : isProofKey(stored) ? 'app' : 'server'
+}
+
 // Makes a new key for an account and keeps its hash as pending, to be confirmed with
 // POST /api/me/recovery-key/ack. Returns the key itself, the only time it exists.
-function issuePendingKey(accountId) {
+// When the app sends `proofHash` (made from words it generated itself) the server keeps only that and returns no words; an
+// older app that sends nothing is given words by the server, as before.
+function issuePendingKey(accountId, proofHash = null) {
+  if (proofHash) {
+    db.prepare('UPDATE accounts SET pending_recovery_key_hash = ? WHERE id = ?').run(storedProofKey(proofHash), accountId)
+    return null
+  }
   const key = generateRecoveryKey()
   db.prepare('UPDATE accounts SET pending_recovery_key_hash = ? WHERE id = ?').run(hashRecoveryKey(key), accountId)
   return key
@@ -817,6 +829,8 @@ app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
   }
   const problem = passwordProblem(password)
   if (problem) return res.status(400).json({ error: problem })
+  const proofHash = body.recoveryProofHash === undefined ? null : cleanProofHash(body.recoveryProofHash)
+  if (body.recoveryProofHash !== undefined && !proofHash) return res.status(400).json({ error: 'recoveryProofHash is not valid' })
 
   const hash = await hashPassword(password)
 
@@ -836,7 +850,7 @@ app.post('/api/register', registerLimiter, asyncHandler(async (req, res) => {
   const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(info.lastInsertRowid)
   // The recovery key is made now and shown once, with the account. It counts once the
   // person confirms they saved it.
-  res.json(sessionResponse(account, { recoveryKey: issuePendingKey(account.id) }))
+  res.json(sessionResponse(account, { recoveryKey: issuePendingKey(account.id, proofHash) }))
 }))
 
 app.post('/api/login', loginLimiter, asyncHandler(async (req, res) => {
@@ -867,7 +881,8 @@ app.get('/api/me', requireAuth, (req, res) => {
     username: req.account.username,
     isAdmin: req.account.isAdmin,
     avatarUpdatedAt: (account && account.avatar_updated_at) || null,
-    recoveryKeyAcked: !!(account && account.recovery_key_hash)
+    recoveryKeyAcked: !!(account && account.recovery_key_hash),
+    recoveryKeyBy: keyMaker(account && account.recovery_key_hash)
   })
 })
 
@@ -881,11 +896,13 @@ app.get('/api/me', requireAuth, (req, res) => {
 app.post('/api/me/recovery-key', accountSecretsLimiter, requireAuth, asyncHandler(async (req, res) => {
   const { password } = req.body || {}
   if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  const proofHash = req.body.recoveryProofHash === undefined ? null : cleanProofHash(req.body.recoveryProofHash)
+  if (req.body.recoveryProofHash !== undefined && !proofHash) return res.status(400).json({ error: 'recoveryProofHash is not valid' })
   const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.account.sub)
   if (!account || !(await verifyPassword(password, account.password_hash))) {
     return res.status(401).json({ error: 'Incorrect password' })
   }
-  res.json({ recoveryKey: issuePendingKey(account.id) })
+  res.json({ recoveryKey: issuePendingKey(account.id, proofHash) })
 }))
 
 // The person confirmed they saved the key they were just shown: it becomes the working
@@ -925,17 +942,27 @@ app.post('/api/me/password', accountSecretsLimiter, requireAuth, asyncHandler(as
 // key is spent by use: a new one comes back, to be confirmed like any other, and every
 // older session ends.
 app.post('/api/recover', recoverLimiter, asyncHandler(async (req, res) => {
-  const { username, key, newPassword } = req.body || {}
+  const { username, key, proof, newPassword } = req.body || {}
   const problem = passwordProblem(newPassword)
-  if (typeof username !== 'string' || typeof key !== 'string' || !username.trim() || !key.trim()) {
+  // The proof (made by the app from the words, which are never sent) is the way in; `key`, the words themselves, is only for
+  // an account whose key an older server made.
+  const given = typeof proof === 'string' ? proof : typeof key === 'string' ? key : ''
+  if (typeof username !== 'string' || !username.trim() || !given.trim()) {
     return res.status(400).json({ error: 'Username, recovery key and a new password are required' })
   }
   if (problem) return res.status(400).json({ error: problem })
+  const nextProofHash = req.body.newRecoveryProofHash === undefined ? null : cleanProofHash(req.body.newRecoveryProofHash)
+  if (req.body.newRecoveryProofHash !== undefined && !nextProofHash) return res.status(400).json({ error: 'newRecoveryProofHash is not valid' })
   const name = username.trim()
   const account =
     db.prepare('SELECT * FROM accounts WHERE username = ?').get(name) ||
     db.prepare('SELECT * FROM accounts WHERE username = ? COLLATE NOCASE').get(name)
-  if (!account || !recoveryKeyMatches(key, account.recovery_key_hash)) {
+  if (!account || !recoveryMatches(account.recovery_key_hash, { key: typeof proof === 'string' ? undefined : key, proof })) {
+    // An account whose key an older server made can only be opened with its words: say so, so the app can send them. Usernames
+    // are not secret (sign-up already says when one is taken), and nothing else is revealed.
+    if (account && account.recovery_key_hash && !isProofKey(account.recovery_key_hash) && typeof proof === 'string') {
+      return res.status(401).json({ error: "That username and recovery key don't match", reason: 'legacy_key' })
+    }
     return res.status(401).json({ error: "That username and recovery key don't match" })
   }
   const hash = await hashPassword(newPassword)
@@ -951,7 +978,7 @@ app.post('/api/recover', recoverLimiter, asyncHandler(async (req, res) => {
     return res.status(401).json({ error: "That username and recovery key don't match" })
   }
   const fresh = db.prepare('SELECT * FROM accounts WHERE id = ?').get(account.id)
-  res.json(sessionResponse(fresh, { recoveryKey: issuePendingKey(account.id) }))
+  res.json(sessionResponse(fresh, { recoveryKey: issuePendingKey(account.id, nextProofHash) }))
 }))
 
 // --- Deleting an account ---
@@ -1108,13 +1135,24 @@ app.delete('/api/me/avatar', requireAuth, (req, res) => {
 // Unauthenticated on purpose, same as the color swatch today: this is a
 // picture someone chose to show people they're in a server with, not a
 // secret, and an <img> tag can't attach an auth header anyway.
-app.get('/api/avatars/:accountId', (req, res) => {
+// An avatar is shown to the person it belongs to and to people who share a server with them (a guest counts for the server
+// they came in to). Anyone else, signed in or not, gets the same answer as for an account with no picture, so ids cannot be
+// walked to collect pictures or count accounts.
+app.get('/api/avatars/:accountId', requireAuthOrGuest, (req, res) => {
+  const target = Number(req.params.accountId)
+  const allowed = req.guest
+    ? !!getMembership(req.guest.serverId, target)
+    : req.account.sub === target ||
+      !!db
+        .prepare('SELECT 1 FROM server_members a JOIN server_members b ON a.server_id = b.server_id WHERE a.account_id = ? AND b.account_id = ? LIMIT 1')
+        .get(req.account.sub, target)
+  if (!allowed) return res.status(404).end()
   const row = db
     .prepare('SELECT avatar_image, avatar_mime, avatar_updated_at FROM accounts WHERE id = ?')
     .get(Number(req.params.accountId))
   if (!row || !row.avatar_image) return res.status(404).end()
   res.set('Content-Type', row.avatar_mime)
-  res.set('Cache-Control', 'public, max-age=31536000, immutable') // safe: the URL's ?v= changes when the image does
+  res.set('Cache-Control', 'private, max-age=31536000, immutable') // safe: the URL's ?v= changes when the image does
   res.set('ETag', String(row.avatar_updated_at))
   res.send(row.avatar_image)
 })
@@ -2458,11 +2496,16 @@ app.put('/api/me/keyring', accountSecretsLimiter, requireAuth, (req, res) => {
   if (!Number.isInteger(body.baseVersion) || body.baseVersion !== account.keyring_version) {
     return res.status(409).json({ error: 'The backup changed since you read it', reason: 'version_conflict', version: account.keyring_version })
   }
-  // A new or different proof must come with the recovery key it was made from.
+  // A new or different proof must come with the recovery key it was made from: for a key the app made, that is the proof
+  // itself (the words never leave the app); for one an older server made, the words.
   if (account.keyring_proof_hash !== proofHash) {
     if (!account.recovery_key_hash) return res.status(409).json({ error: 'Confirm your recovery key first', reason: 'no_recovery_key' })
-    if (!recoveryKeyMatches(body.recoveryKey, account.recovery_key_hash)) {
-      return res.status(401).json({ error: "That isn't your recovery key", reason: 'bad_recovery_key' })
+    const appMade = isProofKey(account.recovery_key_hash)
+    const ok = appMade
+      ? storedProofKey(proofHash) === account.recovery_key_hash && recoveryMatches(account.recovery_key_hash, { proof: body.recoveryProof })
+      : recoveryKeyMatches(body.recoveryKey, account.recovery_key_hash)
+    if (!ok) {
+      return res.status(401).json({ error: "That isn't your recovery key", reason: 'bad_recovery_key', ...(appMade ? {} : { legacy: true }) })
     }
   }
   const now = Date.now()
