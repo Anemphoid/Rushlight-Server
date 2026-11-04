@@ -71,3 +71,5 @@ Nobody can reset, take over or read the account of another person.
    a new one (Settings > Account); until then the old limit stands for them. The reset route tells an app that an account's key is
    of the older kind (`reason: legacy_key`) so the app can send the words in that one case; usernames are not secret (sign-up says
    when one is taken), and nothing else is revealed.
+5. **The owner-change record kept account numbers after an account was deleted.** Closed: deleting an account clears its number from
+   `ownership_log` (0 stands for a deleted account). Tested in `test/account-deletion.test.js`.

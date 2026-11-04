@@ -222,3 +222,26 @@ test('deleting is rate limited like the other password routes', async () => {
     await limited.stop()
   }
 })
+
+test('the record of who handed a server to whom keeps no trace of an account that is deleted', async () => {
+  const w = await world()
+  const next = await w.join()
+  assert.equal((await srv.call('POST', `/api/servers/${w.s.id}/transfer`, { accountId: next.id, password: PASSWORD }, w.owner.token)).status, 200)
+  let d = readDb()
+  const before = d.prepare('SELECT from_owner_id, to_owner_id FROM ownership_log WHERE server_id = ?').all(w.s.id)
+  d.close()
+  assert.deepEqual(before, [{ from_owner_id: w.owner.id, to_owner_id: next.id }])
+  // the old owner is only an admin now, so they can delete their account
+  assert.equal((await del(w.owner)).status, 200)
+  d = readDb()
+  assert.deepEqual(d.prepare('SELECT from_owner_id, to_owner_id FROM ownership_log WHERE server_id = ?').all(w.s.id), [{ from_owner_id: null, to_owner_id: next.id }])
+  d.close()
+  // and the new owner's number goes too when they are deleted (after handing the server on)
+  const third = await w.join()
+  assert.equal((await srv.call('POST', `/api/servers/${w.s.id}/transfer`, { accountId: third.id, password: PASSWORD }, next.token)).status, 200)
+  assert.equal((await del(next)).status, 200)
+  d = readDb()
+  const rows = d.prepare('SELECT from_owner_id, to_owner_id FROM ownership_log WHERE server_id = ? ORDER BY id').all(w.s.id)
+  d.close()
+  assert.deepEqual(rows, [{ from_owner_id: null, to_owner_id: 0 }, { from_owner_id: null, to_owner_id: third.id }])
+})
