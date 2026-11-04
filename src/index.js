@@ -39,8 +39,21 @@ import {
   signSession,
   signGuest,
   requireAuth,
-  requireAuthOrGuest
+  requireAuthOrGuest,
+  markSeen,
+  onSeen
 } from './auth.js'
+import {
+  OWNER_DORMANT_MS,
+  SUCCESSION_NOTICE_MS,
+  ownerOf,
+  ownerSeenAt,
+  isDormant,
+  otherAdmins,
+  majorityOf,
+  addNotice,
+  moveOwnership
+} from './ownership.js'
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY
@@ -771,6 +784,7 @@ function passwordProblem(password) {
 
 // What a client is told about an account after it signs in or up.
 function sessionResponse(account, extra = {}) {
+  markSeen(account.id, { force: true }) // signing in is being seen (and ends any claim against an owner who returns)
   return {
     token: signSession(account),
     id: account.id,
@@ -1008,6 +1022,9 @@ app.delete('/api/me', accountSecretsLimiter, requireAuth, asyncHandler(async (re
     db.prepare('DELETE FROM key_envelopes WHERE recipient_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
     db.prepare('UPDATE key_envelopes SET sender_device_id = NULL WHERE sender_device_id IN (SELECT id FROM device_keys WHERE account_id = ?)').run(accountId)
     db.prepare('DELETE FROM device_keys WHERE account_id = ?').run(accountId)
+    // votes they cast, and claims they made (an open one simply ends)
+    db.prepare('DELETE FROM succession_votes WHERE account_id = ? OR claim_id IN (SELECT id FROM succession_claims WHERE claimant_id = ?)').run(accountId, accountId)
+    db.prepare('DELETE FROM succession_claims WHERE claimant_id = ?').run(accountId)
     db.prepare('DELETE FROM server_members WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM server_bans WHERE account_id = ?').run(accountId)
     db.prepare('UPDATE server_bans SET banned_by = NULL WHERE banned_by = ?').run(accountId)
@@ -1145,7 +1162,8 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
     e2ee: { enabled: !!server.e2ee_enabled, epoch: server.e2ee_epoch, rekeyNeeded: !!server.rekey_needed, minClient: MIN_E2EE_CLIENT },
     channels: serializeTree(server.id),
     presence: presenceForServer(server.id),
-    proposals: proposalsForServer(server.id, req.account.sub)
+    proposals: proposalsForServer(server.id, req.account.sub),
+    ...ownershipView(server.id, req.account.sub, !!req.membership.is_admin)
   })
 })
 
@@ -1155,6 +1173,162 @@ app.patch('/api/servers/:id', requireAuth, requireServerAdmin, (req, res) => {
   db.prepare('UPDATE servers SET name = ? WHERE id = ?').run(name, req.params.id)
   res.json({ updated: true })
 })
+
+// --- Owner succession ---------------------------------------------------
+// An owner who has vanished must not strand a server. After OWNER_DORMANT_MS with no request from any of the owner's sessions,
+// any admin can start a claim. Everyone sees it for SUCCESSION_NOTICE_MS (the owner signing in ends it), and when that time
+// is up it passes if a majority of the OTHER admins (those other than the owner) voted yes; the claimant is the new owner and
+// the old owner stays an admin. A server with no admin besides its owner cannot be claimed here: the person who runs the
+// server machine uses the command line tool (src/cli.js) for that. None of this touches messages or keys: a new owner needs
+// nothing from the old one, because the server key is shared by all members.
+function openClaim(serverId) {
+  return db.prepare("SELECT * FROM succession_claims WHERE server_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1").get(serverId)
+}
+
+function claimView(claim, viewerId) {
+  const voters = otherAdmins(db, claim.server_id)
+  const votes = db.prepare('SELECT account_id, vote FROM succession_votes WHERE claim_id = ?').all(claim.id)
+  const eligible = new Set(voters.map((v) => v.id))
+  const counted = votes.filter((v) => eligible.has(v.account_id))
+  const claimant = db.prepare('SELECT username FROM accounts WHERE id = ?').get(claim.claimant_id)
+  const mine = votes.find((v) => v.account_id === viewerId)
+  return {
+    id: claim.id,
+    claimantId: claim.claimant_id,
+    claimantName: claimant ? claimant.username : 'someone',
+    startedAt: claim.started_at,
+    endsAt: claim.ends_at,
+    msLeft: Math.max(0, claim.ends_at - Date.now()),
+    eligible: voters.length,
+    needed: majorityOf(voters.length),
+    yes: counted.filter((v) => v.vote === 1).length,
+    no: counted.filter((v) => v.vote === 0).length,
+    myVote: mine ? (mine.vote === 1 ? 'yes' : 'no') : null,
+    canVote: eligible.has(viewerId)
+  }
+}
+
+// What the server screen shows about ownership: an open claim (everyone sees the banner), notices still in force, and, for
+// admins who are not the owner, whether the owner counts as dormant yet.
+function ownershipView(serverId, viewerId, viewerIsAdmin) {
+  settleClaims() // a claim whose time is up is settled before anyone looks at it
+  const now = Date.now()
+  const claim = openClaim(serverId)
+  const notices = db
+    .prepare('SELECT id, kind, text, created_at FROM server_notices WHERE server_id = ? AND expires_at > ? ORDER BY id DESC LIMIT 5')
+    .all(serverId, now)
+    .map((n) => ({ id: n.id, kind: n.kind, text: n.text, createdAt: n.created_at }))
+  const owner = ownerOf(db, serverId)
+  const out = { succession: claim ? claimView(claim, viewerId) : null, notices }
+  if (owner && viewerIsAdmin && owner.owner_id !== viewerId) {
+    out.ownerStatus = {
+      ownerName: owner.owner_name,
+      lastSeenAt: ownerSeenAt(owner),
+      dormant: isDormant(owner, now),
+      dormantAfterMs: OWNER_DORMANT_MS,
+      noticeMs: SUCCESSION_NOTICE_MS,
+      otherAdmins: otherAdmins(db, serverId).length
+    }
+  }
+  return out
+}
+
+function closeClaim(claim, status, reason, now = Date.now()) {
+  db.prepare('UPDATE succession_claims SET status = ?, ended_at = ?, ended_reason = ? WHERE id = ?').run(status, now, reason, claim.id)
+}
+
+// Closes every claim that has ended: the owner came back, or the notice period is over (then it passes or it does not).
+function settleClaims(now = Date.now()) {
+  for (const claim of db.prepare("SELECT * FROM succession_claims WHERE status = 'open'").all()) {
+    const owner = ownerOf(db, claim.server_id)
+    if (!owner) {
+      closeClaim(claim, 'cancelled', 'server_gone', now)
+      continue
+    }
+    if (ownerSeenAt(owner) > claim.started_at) {
+      closeClaim(claim, 'cancelled', 'owner_returned', now)
+      continue
+    }
+    if (now < claim.ends_at) continue
+    const v = claimView(claim, null)
+    const claimantStillAdmin = otherAdmins(db, claim.server_id).some((a) => a.id === claim.claimant_id)
+    if (v.yes >= v.needed && v.eligible > 0 && claimantStillAdmin) {
+      moveOwnership(db, { serverId: claim.server_id, toId: claim.claimant_id, via: 'vote', note: `claim ${claim.id}: ${v.yes} of ${v.eligible} admins`, now })
+      closeClaim(claim, 'passed', 'majority', now)
+      addNotice(db, claim.server_id, 'owner_changed', `${v.claimantName} is now the owner of this server. The previous owner, ${owner.owner_name}, had not been seen for a long time and a majority of the admins agreed. ${owner.owner_name} is still an admin.`, now)
+      console.warn(`Owner of server ${claim.server_id} (${owner.server_name}) changed by admin vote: ${owner.owner_name} -> ${v.claimantName} (${v.yes} of ${v.eligible} admins)`)
+    } else {
+      closeClaim(claim, 'expired', claimantStillAdmin ? 'no_majority' : 'claimant_gone', now)
+    }
+  }
+}
+// an owner who is seen closes any claim against them at once
+onSeen((accountId) => {
+  db.prepare(
+    `UPDATE succession_claims SET status = 'cancelled', ended_at = ?, ended_reason = 'owner_returned'
+     WHERE status = 'open' AND server_id IN (SELECT id FROM servers WHERE owner_id = ?)`
+  ).run(Date.now(), accountId)
+})
+
+app.post('/api/servers/:id/succession', accountSecretsLimiter, requireAuth, requireServerAdmin, asyncHandler(async (req, res) => {
+  const serverId = Number(req.params.id)
+  const me = db.prepare('SELECT password_hash FROM accounts WHERE id = ?').get(req.account.sub)
+  const { password } = req.body || {}
+  if (typeof password !== 'string' || !password) return res.status(400).json({ error: 'Your password is required' })
+  if (!me || !(await verifyPassword(password, me.password_hash))) return res.status(401).json({ error: 'Incorrect password' })
+  settleClaims()
+  const owner = ownerOf(db, serverId)
+  if (!owner) return res.status(404).json({ error: 'Server not found' })
+  if (owner.owner_id === req.account.sub) return res.status(400).json({ error: 'You already own this server' })
+  if (!isDormant(owner)) {
+    return res.status(409).json({ error: `${owner.owner_name} has been seen recently, so the server cannot be claimed.`, reason: 'owner_active' })
+  }
+  if (openClaim(serverId)) return res.status(409).json({ error: 'There is already a claim open for this server', reason: 'claim_open' })
+  const now = Date.now()
+  const id = db.transaction(() => {
+    const info = db
+      .prepare("INSERT INTO succession_claims (server_id, claimant_id, started_at, ends_at, status) VALUES (?, ?, ?, ?, 'open')")
+      .run(serverId, req.account.sub, now, now + SUCCESSION_NOTICE_MS)
+    db.prepare('INSERT INTO succession_votes (claim_id, account_id, vote, voted_at) VALUES (?, ?, 1, ?)').run(info.lastInsertRowid, req.account.sub, now)
+    return info.lastInsertRowid
+  })()
+  console.warn(`${req.account.username} started a claim to own server ${serverId} (${owner.server_name}); the owner, ${owner.owner_name}, was last seen ${new Date(ownerSeenAt(owner)).toISOString()}`)
+  res.json({ claim: claimView(db.prepare('SELECT * FROM succession_claims WHERE id = ?').get(id), req.account.sub) })
+}))
+
+app.post('/api/servers/:id/succession/vote', requireAuth, requireServerAdmin, (req, res) => {
+  const serverId = Number(req.params.id)
+  settleClaims()
+  const claim = openClaim(serverId)
+  if (!claim) return res.status(404).json({ error: 'There is no claim open for this server', reason: 'no_claim' })
+  const vote = (req.body || {}).vote
+  if (vote !== 'yes' && vote !== 'no') return res.status(400).json({ error: 'vote must be yes or no' })
+  if (ownerIdOf(serverId) === req.account.sub) return res.status(403).json({ error: 'The owner does not vote on a claim against them' })
+  db.prepare(
+    `INSERT INTO succession_votes (claim_id, account_id, vote, voted_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (claim_id, account_id) DO UPDATE SET vote = excluded.vote, voted_at = excluded.voted_at`
+  ).run(claim.id, req.account.sub, vote === 'yes' ? 1 : 0, Date.now())
+  res.json({ claim: claimView(claim, req.account.sub) })
+})
+
+// The person who started a claim can withdraw it.
+app.post('/api/servers/:id/succession/cancel', requireAuth, requireServerAdmin, (req, res) => {
+  const claim = openClaim(Number(req.params.id))
+  if (!claim) return res.status(404).json({ error: 'There is no claim open for this server', reason: 'no_claim' })
+  if (claim.claimant_id !== req.account.sub) return res.status(403).json({ error: 'Only the person who started the claim can withdraw it' })
+  closeClaim(claim, 'cancelled', 'withdrawn')
+  res.json({ cancelled: true })
+})
+
+const SUCCESSION_CHECK_MS = Number(process.env.SUCCESSION_CHECK_MS) || 60 * 1000
+setInterval(() => {
+  try {
+    settleClaims()
+    db.prepare('DELETE FROM server_notices WHERE expires_at < ?').run(Date.now() - 24 * 60 * 60 * 1000)
+  } catch (err) {
+    console.error('succession check:', err)
+  }
+}, SUCCESSION_CHECK_MS).unref()
 
 // Deleting a server is the owner's alone, and needs their password, so a stolen session
 // can't wipe a server. It removes every channel, room, message, code and membership.
@@ -1198,6 +1372,10 @@ app.delete('/api/servers/:id', accountSecretsLimiter, requireAuth, requireServer
     db.prepare('DELETE FROM server_members WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM server_music WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM key_envelopes WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM succession_votes WHERE claim_id IN (SELECT id FROM succession_claims WHERE server_id = ?)').run(id)
+    db.prepare('DELETE FROM succession_claims WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM server_notices WHERE server_id = ?').run(id)
+    db.prepare('DELETE FROM ownership_log WHERE server_id = ?').run(id)
     db.prepare('DELETE FROM servers WHERE id = ?').run(id)
   })
   tx()
@@ -1228,11 +1406,7 @@ app.post('/api/servers/:id/transfer', accountSecretsLimiter, requireAuth, requir
   const done = db.transaction(() => {
     if (ownerIdOf(serverId) !== req.account.sub) return 'not-owner'
     if (!getMembership(serverId, targetId)) return 'not-member'
-    db.prepare('UPDATE servers SET owner_id = ? WHERE id = ?').run(targetId, serverId)
-    db.prepare(
-      'UPDATE server_members SET is_admin = 1, muted = 0, access_expires_at = NULL WHERE server_id = ? AND account_id = ?'
-    ).run(serverId, targetId)
-    db.prepare('UPDATE server_members SET is_admin = 1 WHERE server_id = ? AND account_id = ?').run(serverId, req.account.sub)
+    moveOwnership(db, { serverId, toId: targetId, via: 'handover' })
     return 'ok'
   })()
   if (done === 'not-owner') return res.status(403).json({ error: 'Only the server owner can do that' })
