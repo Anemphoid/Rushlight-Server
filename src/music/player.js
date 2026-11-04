@@ -284,7 +284,10 @@ export class Player {
     if (!jf) throw new Error('music is no longer linked')
     const web = await jf.audio(track.id)
     const input = Readable.fromWeb(web)
-    const args = ['-v', 'error', '-nostdin', ...(this.startAt ? ['-ss', String(this.startAt / 1000)] : []), '-i', 'pipe:0', '-vn', '-f', 's16le', '-ar', '48000', '-ac', '1', 'pipe:1']
+    // -ss goes AFTER -i on purpose: the song arrives on a pipe, and ffmpeg 7 skips the wrong amount when asked to seek a
+    // piped input (about 4.6 s instead of 1.7 s), so a resumed or sought song lost seconds. Placed after the input it decodes
+    // and drops the start, exactly, on every version.
+    const args = ['-v', 'error', '-nostdin', '-i', 'pipe:0', ...(this.startAt ? ['-ss', String(this.startAt / 1000)] : []), '-vn', '-f', 's16le', '-ar', '48000', '-ac', '1', 'pipe:1']
     const proc = spawn('ffmpeg', args, { stdio: ['pipe', 'pipe', 'ignore'] })
     this.proc = proc
     proc.on('error', () => {})
