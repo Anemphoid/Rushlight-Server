@@ -84,7 +84,30 @@ export function requireAuth(req, res, next) {
   if (error) return res.status(401).json(reason ? { error, reason } : { error })
   if (payload.guest) return res.status(401).json({ error: 'This needs an account' })
   req.account = payload
+  markSeen(payload.sub)
   next()
+}
+
+// "Last seen": a request from one of the account's sessions. Written at most once per SEEN_EVERY_MS per account, so busy
+// polling does not become busy writing. It is what decides whether a server's owner is dormant, and an owner being seen
+// closes any claim against them (index.js registers that with onSeen).
+const SEEN_EVERY_MS = Number(process.env.SEEN_EVERY_MS) || 60 * 1000
+const seenAt = new Map()
+const touch = db.prepare('UPDATE accounts SET last_seen_at = ? WHERE id = ?')
+let seenHook = null
+export const onSeen = (fn) => {
+  seenHook = fn
+}
+export function markSeen(accountId, { force = false } = {}) {
+  const now = Date.now()
+  if (!force && now - (seenAt.get(accountId) || 0) < SEEN_EVERY_MS) return
+  seenAt.set(accountId, now)
+  try {
+    touch.run(now, accountId)
+    if (seenHook) seenHook(accountId, now)
+  } catch (err) {
+    console.error('could not record when an account was last seen:', err.message)
+  }
 }
 
 // Accounts or guests: sets req.account or req.guest, whichever it is.

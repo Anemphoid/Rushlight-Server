@@ -217,6 +217,41 @@ routes (`ACCOUNT_LIMIT`):
 `GET /api/servers`, `GET /api/servers/:id` and the members list carry `isOwner`. No
 migration.
 
+### When the owner has vanished: a vote, or the command line tool
+
+A server must not be lost because its owner disappeared. The server notes when each account's sessions last made a request
+(`accounts.last_seen_at`; an open app counts, because it checks every few seconds). The owner counts as **dormant** after 90
+days (`OWNER_DORMANT_MS`) with none.
+
+**By vote (the server has other admins).** Any admin other than the owner can start a claim (`POST /api/servers/:id/succession`,
+their password again), and only once the owner is dormant. Every member sees a banner, and the server screen carries the claim
+(`succession`: who, when it ends, votes, how many are needed) and, for admins, how long the owner has been gone (`ownerStatus`).
+Admins other than the owner vote yes or no (`POST .../succession/vote`); the claimant's own vote is yes. The claim waits out the
+whole **14 day** notice (`SUCCESSION_NOTICE_MS`) whatever the votes, so a server with one admin still gives the owner the same
+time to come back. If the owner makes any request or signs in during that time, the claim is cancelled at once. When the time
+is up it passes if a majority of the other admins voted yes: the claimant becomes the owner, the old owner **stays an admin**,
+every member is shown a notice for 14 days (`notices`), and the change is written to `ownership_log`. Otherwise it expires and
+nothing changes. The claimant can withdraw (`.../succession/cancel`). Ownership moves only; no key or message is involved, because
+a new owner needs nothing from the old one.
+
+**By the person who runs the server machine (no other admin).** A server whose only admin is its owner cannot be claimed in the
+app. For that case only, there is a command line tool, run on the machine in the server's folder as the user that runs the server
+(it reads the same `.env` and database):
+
+```
+node src/cli.js servers                               # every server, its owner, when the owner was last seen
+node src/cli.js set-owner <server id> <username>      # asks you to type the server's name; add --yes to skip that
+```
+
+It refuses when the server has any other admin (they vote instead), when the owner has been seen within the dormancy period, or
+when the named person is not a member. It prints a loud line to the log, writes `ownership_log`, shows every member a notice naming
+the new owner and that the person who runs the server did it, and leaves the old owner an admin. It changes who the owner is and
+nothing else: it reads no message and touches no password, recovery key, device or key (a test compares the database before and
+after). With Docker, run it inside the container.
+
+For testing, `OWNER_DORMANT_MS`, `SUCCESSION_NOTICE_MS`, `SUCCESSION_CHECK_MS` (how often claims are settled, default one minute),
+`SEEN_EVERY_MS` (how often a last-seen time is written per account, default one minute) and `NOTICE_KEEP_MS` can be set small.
+
 ### Deleting an account
 
 `DELETE /api/me` with `{ password }`. **Permanent and immediate**; take a database backup before
