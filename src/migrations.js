@@ -395,6 +395,61 @@ export const migrations = [
         CREATE INDEX IF NOT EXISTS idx_keyring_history_account ON keyring_history(account_id);
       `)
     }
+  },
+  {
+    id: 19,
+    name: 'owner succession: when accounts were last seen, claims and votes, notices, and an ownership log',
+    up(db) {
+      // last_seen_at is the last time a session of the account made a request (written at most once a minute). It starts at
+      // the moment of this upgrade for every account, so nobody counts as dormant on the day it is installed. A claim to
+      // become owner of a server whose owner has not been seen for a long time lasts for a notice period; admins vote on it.
+      // server_notices is what every member is shown for a while (an ownership change they should know about).
+      // ownership_log is a plain record of every change of owner and how it happened. The database layout is final after this.
+      db.exec(`
+        ALTER TABLE accounts ADD COLUMN last_seen_at INTEGER;
+        UPDATE accounts SET last_seen_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000;
+
+        CREATE TABLE IF NOT EXISTS succession_claims (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          server_id INTEGER NOT NULL REFERENCES servers(id),
+          claimant_id INTEGER NOT NULL REFERENCES accounts(id),
+          started_at INTEGER NOT NULL,
+          ends_at INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open',      -- open | passed | expired | cancelled
+          ended_at INTEGER,
+          ended_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_succession_claims_server ON succession_claims(server_id, status);
+
+        CREATE TABLE IF NOT EXISTS succession_votes (
+          claim_id INTEGER NOT NULL REFERENCES succession_claims(id),
+          account_id INTEGER NOT NULL REFERENCES accounts(id),
+          vote INTEGER NOT NULL,                    -- 1 yes, 0 no
+          voted_at INTEGER NOT NULL,
+          PRIMARY KEY (claim_id, account_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS server_notices (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          server_id INTEGER NOT NULL REFERENCES servers(id),
+          kind TEXT NOT NULL,
+          text TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_server_notices_server ON server_notices(server_id);
+
+        CREATE TABLE IF NOT EXISTS ownership_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          server_id INTEGER NOT NULL,
+          from_owner_id INTEGER,
+          to_owner_id INTEGER NOT NULL,
+          via TEXT NOT NULL,                        -- handover | vote | operator
+          at INTEGER NOT NULL,
+          note TEXT
+        );
+      `)
+    }
   }
 ]
 
