@@ -330,12 +330,16 @@ cmd_restore() {
   local had_env=0 keep_img="" keep_ver="" keep_lk=""
   if [ -f .env ]; then had_env=1; keep_img="$(env_get RUSHLIGHT_IMAGE)"; keep_ver="$(env_get RUSHLIGHT_VERSION)"; keep_lk="$(env_get LIVEKIT_VERSION)"; compose stop server >/dev/null 2>&1 || true; fi
   volrun "$img:$ver" sh -c 'rm -rf /data/restore-tmp /data/before-restore; if [ -f /data/rushlight.db ]; then mkdir /data/before-restore && cp -p /data/rushlight.db* /data/before-restore/; fi'
+  # The file goes into the volume first (read through a plain redirect: its owner on this computer need not be the container's user).
+  ensure_volume
+  docker run --rm -i --network none -v "$VOLUME:/data" --entrypoint sh "$img:$ver" -c 'cat > /data/restore-in.rlbak' < "$file" \
+    || { [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "I could not read $file. Nothing was changed."; }
   local tty=(-i); [ -t 0 ] && tty=(-it)
-  docker run --rm "${tty[@]}" --network none -v "$VOLUME:/data" -v "$file:/in/backup.rlbak:ro" --entrypoint node "$img:$ver" src/backup-cli.js restore /in/backup.rlbak /data/restore-tmp \
-    || { volrun "$img:$ver" rm -rf /data/restore-tmp >/dev/null 2>&1 || true; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "The backup was not restored (wrong words, or a damaged file). Nothing was changed."; }
+  docker run --rm "${tty[@]}" --network none -v "$VOLUME:/data" --entrypoint node "$img:$ver" src/backup-cli.js restore /data/restore-in.rlbak /data/restore-tmp \
+    || { volrun "$img:$ver" rm -rf /data/restore-tmp /data/restore-in.rlbak >/dev/null 2>&1 || true; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "The backup was not restored (wrong words, or a damaged file). Nothing was changed."; }
   (umask 077; volrun "$img:$ver" cat /data/restore-tmp/restored.env > .env.restored)
   [ -s .env.restored ] || { rm -f .env.restored; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "That backup holds no settings file. Nothing was changed."; }
-  volrun "$img:$ver" sh -c 'rm -f /data/rushlight.db* && mv /data/restore-tmp/rushlight.db /data/rushlight.db && rm -rf /data/restore-tmp'
+  volrun "$img:$ver" sh -c 'rm -f /data/rushlight.db* && mv /data/restore-tmp/rushlight.db /data/rushlight.db && rm -rf /data/restore-tmp /data/restore-in.rlbak'
   [ ! -f .env ] || mv .env .env.before-restore
   mv .env.restored .env
   fix_env_perms
