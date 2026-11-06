@@ -1055,6 +1055,9 @@ app.delete('/api/me', accountSecretsLimiter, requireAuth, asyncHandler(async (re
     db.prepare('DELETE FROM server_members WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM server_bans WHERE account_id = ?').run(accountId)
     db.prepare('UPDATE server_bans SET banned_by = NULL WHERE banned_by = ?').run(accountId)
+    // the record of who handed a server to whom keeps no trace of this account: 0 means "a deleted account"
+    db.prepare('UPDATE ownership_log SET from_owner_id = NULL WHERE from_owner_id = ?').run(accountId)
+    db.prepare('UPDATE ownership_log SET to_owner_id = 0 WHERE to_owner_id = ?').run(accountId)
     db.prepare('UPDATE join_codes SET created_by = NULL WHERE created_by = ?').run(accountId)
     db.prepare('DELETE FROM access_ends WHERE account_id = ?').run(accountId)
     db.prepare('DELETE FROM accounts WHERE id = ?').run(accountId) // the avatar lives on this row
