@@ -54,8 +54,10 @@ import {
   addNotice,
   moveOwnership
 } from './ownership.js'
+import { livekitUrlForClient, checkPublicLivekitUrl } from './livekit-url.js'
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL
+const LIVEKIT_PUBLIC_URL = checkPublicLivekitUrl(process.env.LIVEKIT_PUBLIC_URL)
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
@@ -2349,7 +2351,9 @@ app.post('/api/voice/token', requireAuthOrGuest, asyncHandler(async (req, res) =
     // restart this is rebuilt as guests ask for tokens again.
     ensureGuestSession(req.guest).rooms.add(room)
   }
-  res.json({ token, livekitUrl: LIVEKIT_URL, room, encrypted, epoch: voiceState.e2ee_epoch, ...(jellyboxOpen ? { jellyboxOpen: true } : {}) })
+  // the address this client used to reach the server, so voice follows it if the server moves (see src/livekit-url.js)
+  const livekitUrl = livekitUrlForClient({ publicUrl: LIVEKIT_PUBLIC_URL, livekitUrl: LIVEKIT_URL, host: req.hostname, secure: req.protocol === 'https' })
+  res.json({ token, livekitUrl, room, encrypted, epoch: voiceState.e2ee_epoch, ...(jellyboxOpen ? { jellyboxOpen: true } : {}) })
 }))
 
 // --- End-to-end encryption: devices and wrapped keys ---------------------
