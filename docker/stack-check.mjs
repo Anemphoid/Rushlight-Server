@@ -4,6 +4,9 @@
 import { Room, AudioSource, AudioFrame, AudioStream, LocalAudioTrack, TrackPublishOptions, TrackSource, TrackKind, RoomEvent } from '@livekit/rtc-node'
 
 const base = process.argv[2]
+// Optional: connect to LiveKit here instead of the address the server hands out (Public mode's address is https with a certificate
+// made for the test; the voice itself still travels over the network address the stack was set up for).
+const connectUrl = process.argv[3]
 if (!base) throw new Error('usage: node docker/stack-check.mjs http://ADDRESS:PORT')
 let failed = false
 const pass = (m) => console.log('  ok   ' + m)
@@ -42,7 +45,7 @@ const rooms = []
 async function join(tok) {
   const room = new Room()
   rooms.push(room)
-  await room.connect(tok.livekitUrl, tok.token, { autoSubscribe: true, dynacast: false })
+  await room.connect(connectUrl || tok.livekitUrl, tok.token, { autoSubscribe: true, dynacast: false })
   return room
 }
 

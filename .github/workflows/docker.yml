@@ -67,6 +67,8 @@ jobs:
       - run: npm ci --omit=dev
       - name: Stack test (setup, check, voice between two people, restart, a broken stack)
         run: docker/stack-test.sh rushlight-server:test-amd64
+      - name: Public mode test (Caddy in front, a name pointing here, voice, LiveKit closed to the network)
+        run: docker/stack-test-public.sh rushlight-server:test-amd64
 
       - name: Build for Raspberry Pi (arm64)
         if: github.ref_type == 'tag'
