@@ -1,0 +1,34 @@
+# Rushlight, Private mode: the server and LiveKit (voice), on this computer's own network address.
+# Do not edit by hand: `./rushlight setup` writes .env and livekit.yaml next to this file, and everything here reads them.
+#
+# Both programs share the computer's network ("host" networking, Linux only). That keeps voice simple: LiveKit's one UDP
+# port (7882) is reachable exactly as it is on the machine, with no address translation in between.
+name: rushlight
+
+services:
+  server:
+    image: ${RUSHLIGHT_IMAGE:-ghcr.io/anemphoid/rushlight-server}:${RUSHLIGHT_VERSION:-stable}
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/rushlight.db
+      # The encrypted backups include this file, so a restored server keeps its secrets.
+      BACKUP_ENV_FILE: /config/.env
+    volumes:
+      - data:/data
+      - ./.env:/config/.env:ro
+    depends_on:
+      - livekit
+    stop_grace_period: 15s
+
+  livekit:
+    image: livekit/livekit-server:${LIVEKIT_VERSION}
+    network_mode: host
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+volumes:
+  data:
