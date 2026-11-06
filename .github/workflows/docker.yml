@@ -69,6 +69,10 @@ jobs:
         run: docker/stack-test.sh rushlight-server:test-amd64
       - name: Public mode test (Caddy in front, a name pointing here, voice, LiveKit closed to the network)
         run: docker/stack-test-public.sh rushlight-server:test-amd64
+      - name: Tailscale mode test (files, where the key goes, a wrong key; the real sign-in only if a TS_TEST_AUTHKEY secret exists)
+        env:
+          TS_TEST_AUTHKEY: ${{ secrets.TS_TEST_AUTHKEY }}
+        run: docker/stack-test-tailscale.sh rushlight-server:test-amd64
 
       - name: Build for Raspberry Pi (arm64)
         if: github.ref_type == 'tag'
