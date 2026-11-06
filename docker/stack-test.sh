@@ -55,5 +55,7 @@ curl -fsS -m 10 -H 'content-type: application/json' -d "{\"username\":\"$U\",\"p
 if "$R" check >"$DIR/broken.out" 2>&1; then fail "check passed with voice stopped"; fi
 grep -q 'PROBLEM  The voice container' "$DIR/broken.out" && pass "check says so when voice is stopped" || { cat "$DIR/broken.out" >&2; fail "check did not name the voice problem"; }
 
-(cd "$DIR" && docker compose logs 2>&1) | grep -q "$(sed -n 's/^JWT_SECRET=//p' "$DIR/.env")" && fail "a secret is in the logs" || pass "no secret in the logs"
+# (output first, then grep: "grep -q" closing a pipe early can make the writer fail and hide a match)
+all_logs="$(cd "$DIR" && docker compose logs 2>&1)"
+if grep -qF "$(sed -n 's/^JWT_SECRET=//p' "$DIR/.env")" <<<"$all_logs"; then fail "a secret is in the logs"; else pass "no secret in the logs"; fi
 echo "All stack checks passed."
