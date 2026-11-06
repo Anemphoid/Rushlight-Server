@@ -55,6 +55,7 @@ import {
   moveOwnership
 } from './ownership.js'
 import { livekitUrlForClient, checkPublicLivekitUrl } from './livekit-url.js'
+import { startBackupScheduler } from './backup.js'
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL
 const LIVEKIT_PUBLIC_URL = checkPublicLivekitUrl(process.env.LIVEKIT_PUBLIC_URL)
@@ -3580,6 +3581,8 @@ function runRetention() {
 }
 runRetention()
 setInterval(runRetention, RETENTION_EVERY_MS).unref()
+// Encrypted nightly backups, once the operator has set them up (src/backup.js)
+startBackupScheduler()
 purgeOldAccessEnds()
 setInterval(purgeOldAccessEnds, 60 * 60 * 1000).unref()
 setInterval(() => {

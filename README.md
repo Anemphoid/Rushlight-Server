@@ -34,6 +34,9 @@ given the address they used to reach this server, with LiveKit's port, when
 changes, only the address in the app changes and voice follows. Otherwise (a name,
 `wss://`, a reverse proxy) set `LIVEKIT_PUBLIC_URL` to what clients should use.
 
+Turn on encrypted nightly backups once, with `npm run backups -- setup` (it gives you a 12 word phrase to write down).
+See [docs/backups.md](docs/backups.md) for how backups work and how to restore one.
+
 Check it from another machine: `curl http://<host>:4000/api/health` returns
 `{"ok":true}`.
 
