@@ -299,7 +299,10 @@ cmd_backup() {
       say "Copied $name to $dest. It is encrypted: keep it somewhere that is not on this computer."
       ;;
     "") die "Try: ./rushlight backup setup | now | list | check FILE | export [FOLDER]" ;;
-    *) compose exec server node src/backup-cli.js "$@" ;;
+    *)
+      # a terminal for the questions (setup, check, restore) only when there is one; scripts and cron have none
+      local tty=(); [ -t 0 ] || tty=(-T)
+      compose exec "${tty[@]}" server node src/backup-cli.js "$@" ;;
   esac
 }
 

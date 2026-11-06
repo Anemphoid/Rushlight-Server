@@ -63,7 +63,9 @@ PHRASE="$(cd "$DIR" && docker compose exec -T server node --input-type=module -e
 import { makePhrase, keysFromPhrase, writePublicKeyFile } from './src/backup.js'
 const p = makePhrase(); writePublicKeyFile('/data/backup-public.key', keysFromPhrase(p).publicRaw); console.log(p)" | tail -n1 | tr -d '\r')"
 [ "$(wc -w <<<"$PHRASE")" = 12 ] || fail "could not turn backups on"
-"$R" backup now >/dev/null 2>&1 && "$R" backup list 2>&1 | grep -q 'rushlight-' && pass "an encrypted backup is made inside the stack and listed" || fail "backup now / list failed"
+"$R" backup now >"$DIR/backup.out" 2>&1 || { cat "$DIR/backup.out" >&2; fail "backup now failed"; }
+"$R" backup list >"$DIR/backup-list.out" 2>&1 || true
+grep -q 'rushlight-' "$DIR/backup-list.out" && pass "an encrypted backup is made inside the stack and listed" || { cat "$DIR/backup-list.out" >&2; fail "backup list does not show it"; }
 mkdir "$DIR/export" && "$R" backup export "$DIR/export" >/dev/null 2>&1 && ls "$DIR"/export/*.rlbak >/dev/null 2>&1 && pass "the newest backup can be copied out of the container" || fail "backup export failed"
 grep -qaF "$(env_val JWT_SECRET)" "$DIR"/export/*.rlbak && fail "the backup file holds the secret in the clear" || pass "the backup file does not show the secret"
 
@@ -73,7 +75,7 @@ docker tag "$IMAGE" "${IMAGE%:*}:next"
 [ "$(env_val RUSHLIGHT_VERSION)" = next ] && can_login "$U" && pass "update to a new version works and keeps the data" || fail "update lost the version or the data"
 grep -qi 'encrypted backup' "$DIR/update.out" && pass "update made an encrypted backup first" || fail "update did not back up first"
 if (cd "$DIR" && docker run --rm --network none -v rushlight_data:/data --entrypoint sh "${IMAGE%:*}:next" -c 'test -d /data/rollback'); then fail "the safety copy was left behind"; else pass "the safety copy is removed after a good update"; fi
-"$R" update --version next 2>&1 | grep -q 'Already up to date' && pass "updating again says it is already current" || fail "no up-to-date message"
+"$R" update --version next >"$DIR/uptodate.out" 2>&1; grep -q 'Already up to date' "$DIR/uptodate.out" && pass "updating again says it is already current" || fail "no up-to-date message"
 
 # an update that does not start: the new version breaks the database and exits; the old version and data must come back
 printf 'FROM %s\nCMD ["sh","-c",": > /data/rushlight.db; exit 1"]\n' "${IMAGE%:*}:next" | docker build -q -t "${IMAGE%:*}:broken" - >/dev/null
