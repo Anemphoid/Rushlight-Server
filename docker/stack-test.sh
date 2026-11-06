@@ -96,6 +96,32 @@ wait_up && can_login "$U" && pass "wrong words change nothing" || fail "a failed
 echo "$PHRASE" | RUSHLIGHT_IMAGE="${IMAGE%:*}" RUSHLIGHT_VERSION=next "$R" restore "$(ls "$DIR"/export/*.rlbak | head -n1)" >"$DIR/fresh.out" 2>&1 || { cat "$DIR/fresh.out" >&2; fail "restore with no .env failed"; }
 [ "$(env_val JWT_SECRET)" = "$JWT_BEFORE" ] && wait_up && can_login "$U" && pass "restoring on a computer with no settings brings the secrets back too" || fail "fresh restore did not bring back the secrets"
 
+# ---- rotating secrets ----
+token_of() { api_post /api/login "{\"username\":\"$1\",\"password\":\"password123\"}" | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).token)'; }
+token_ok() { curl -fsS -m 10 -H "authorization: Bearer $1" "http://$IP:$PORT/api/me" >/dev/null 2>&1; }
+TOK="$(token_of "$U")"; token_ok "$TOK" || fail "could not get a working sign-in token to test with"
+out="$("$R" rotate-secrets </dev/null 2>&1 || true)"
+grep -q 'Say what to rotate' <<<"$out" && pass "rotate-secrets with nothing chosen and no terminal asks what to rotate" || fail "rotate-secrets did something unasked"
+
+OLD_LK="$(env_val LIVEKIT_API_SECRET)"; OLD_JWT="$(env_val JWT_SECRET)"
+"$R" rotate-secrets --livekit --yes >"$DIR/rot1.out" 2>&1 || { cat "$DIR/rot1.out" >&2; fail "rotating the voice key failed"; }
+[ "$(env_val LIVEKIT_API_SECRET)" != "$OLD_LK" ] && [ "$(env_val JWT_SECRET)" = "$OLD_JWT" ] && token_ok "$TOK" && [ ! -f "$DIR/.env.before-rotate" ] && pass "a new voice key is in use, sign-ins are untouched, the old copy is removed" || fail "voice key rotation changed the wrong things"
+node "$REPO/docker/stack-check.mjs" "http://$IP:$PORT" >"$DIR/rotvoice.out" 2>&1 && pass "two people still hear each other with the new voice key" || { cat "$DIR/rotvoice.out" >&2; fail "voice broke after rotating the key"; }
+
+sed -i '/^MUSIC_SECRET=/d' "$DIR/.env"
+"$R" rotate-secrets --jwt --yes >"$DIR/rot2.out" 2>&1 || { cat "$DIR/rot2.out" >&2; fail "rotating the sign-in secret failed"; }
+[ "$(env_val JWT_SECRET)" != "$OLD_JWT" ] && [ "$(env_val MUSIC_SECRET)" = "$OLD_JWT" ] && pass "a new sign-in secret is in use and Jellybox's key stays readable (pinned to the old one)" || fail "jwt rotation did the wrong thing"
+token_ok "$TOK" && fail "an old sign-in token still works after rotating the sign-in secret" || pass "old sign-ins no longer work"
+can_login "$U" && token_ok "$(token_of "$U")" && pass "signing in again works" || fail "cannot sign in after rotation"
+
+# a rotation that cannot restart puts the old settings back
+sed -i 's/^LIVEKIT_VERSION=.*/LIVEKIT_VERSION=v0.0.0-nope/' "$DIR/.env"
+BEFORE="$(env_val LIVEKIT_API_SECRET)"
+if "$R" rotate-secrets --livekit --yes >"$DIR/rot3.out" 2>&1; then fail "a rotation that cannot restart was reported as fine"; fi
+grep -q 'Putting the old ones back' "$DIR/rot3.out" && [ "$(env_val LIVEKIT_API_SECRET)" = "$BEFORE" ] && pass "a failed rotation puts the old secrets back" || { cat "$DIR/rot3.out" >&2; fail "failed rotation did not restore .env"; }
+sed -i 's/^LIVEKIT_VERSION=.*/LIVEKIT_VERSION=v1.13.11/' "$DIR/.env"
+"$R" start >/dev/null 2>&1 && wait_up && pass "and the stack comes back once the fault is gone" || fail "stack did not come back"
+
 (cd "$DIR" && docker compose stop livekit >/dev/null 2>&1)
 if "$R" check >"$DIR/broken.out" 2>&1; then fail "check passed with voice stopped"; fi
 grep -q 'PROBLEM  The voice container' "$DIR/broken.out" && pass "check says so when voice is stopped" || { cat "$DIR/broken.out" >&2; fail "check did not name the voice problem"; }

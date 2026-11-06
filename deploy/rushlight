@@ -169,6 +169,8 @@ cmd_setup() {
     echo "LIVEKIT_URL=ws://127.0.0.1:7880"
     echo "LIVEKIT_API_KEY=API$(random_hex 8)"
     echo "LIVEKIT_API_SECRET=$(random_hex 32)"
+    echo "# Encrypts the Jellyfin key (Jellybox) at rest. Its own secret, so changing JWT_SECRET never makes a linked library unreadable."
+    echo "MUSIC_SECRET=$(random_hex 32)"
     if [ "$mode" = tailscale ]; then
       echo "# Tailscale mode: the tailscale container is started with the profile below; HOST_IP is this computer's Tailscale address,"
       echo "# filled in when it has joined. (The one-time sign-in key is in tailscale.env, not here, and is emptied after use.)"
@@ -583,6 +585,87 @@ cmd_restore() {
   cmd_start
 }
 
+# rotate-secrets [--jwt] [--livekit] [--all] [--yes]: replace secrets with new ones, safely. The old .env is kept until the new
+# secrets are proven to work, and put back if they do not.
+cmd_rotate() {
+  local jwt=0 lk=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jwt) jwt=1; shift ;;
+      --livekit) lk=1; shift ;;
+      --all) jwt=1; lk=1; shift ;;
+      --yes) yes=1; shift ;;
+      *) die "I do not know '$1'. Try ./rushlight help." ;;
+    esac
+  done
+  need_docker
+  [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  if [ "$jwt" -eq 0 ] && [ "$lk" -eq 0 ]; then
+    [ -t 0 ] || die "Say what to rotate: --jwt (sign-ins), --livekit (voice) or --all."
+    say "Which secrets do you want to replace?"
+    printf '  Sign-ins (JWT secret): everyone is signed out and signs in again. [y/N] '; read -r a || a=n; case "${a:-N}" in [Yy]*) jwt=1 ;; esac
+    printf '  Voice (LiveKit key): anyone in a call is dropped and reconnects. [y/N] '; read -r a || a=n; case "${a:-N}" in [Yy]*) lk=1 ;; esac
+    [ "$jwt" -eq 1 ] || [ "$lk" -eq 1 ] || { say "Nothing was changed."; return 0; }
+  fi
+  say "This will:"
+  [ "$jwt" -eq 0 ] || say "  - replace the sign-in secret: EVERYONE is signed out (their password signs them back in), guests have to join again with their code,"
+  [ "$jwt" -eq 0 ] || say "    and no old sign-in token works any more. Chat, accounts, encryption keys and backups are not touched."
+  [ "$lk" -eq 0 ] || say "  - replace the voice key: people in a call are dropped for a moment and their app reconnects by itself."
+  say "  - restart the server (and LiveKit); keep the old settings until the new ones are proven, and put them back if they fail."
+  if [ "$yes" -ne 1 ]; then
+    printf 'Go ahead? [y/N] '; read -r a || a=n
+    case "${a:-N}" in [Yy]*) ;; *) say "Nothing was changed."; return 0 ;; esac
+  fi
+
+  if compose exec -T server test -f /data/backup-public.key >/dev/null 2>&1; then
+    say "Making an encrypted backup first ..."
+    compose exec -T server node src/backup-cli.js now >/dev/null || die "The backup failed, so I changed nothing."
+  fi
+  (umask 077; cp .env .env.before-rotate)
+
+  if [ "$jwt" -eq 1 ]; then
+    # Jellybox's stored Jellyfin key is encrypted with MUSIC_SECRET, or with the JWT secret when there is none: pin it so it stays readable
+    [ -n "$(env_get MUSIC_SECRET)" ] || env_set MUSIC_SECRET "$(env_get JWT_SECRET)"
+    env_set JWT_SECRET "$(random_hex 48)"
+  fi
+  if [ "$lk" -eq 1 ]; then
+    env_set LIVEKIT_API_KEY "API$(random_hex 8)"
+    env_set LIVEKIT_API_SECRET "$(random_hex 32)"
+  fi
+  write_livekit_config
+  say "Restarting with the new secrets ..."
+  if compose up -d --force-recreate server livekit >/dev/null 2>&1 && wait_healthy 90 && verify_livekit; then
+    rm -f .env.before-rotate
+    say "Done. The new secrets work, and the old ones are gone from this computer."
+    [ "$jwt" -eq 0 ] || say "Everyone is signed out and signs in again with their password."
+    say "Old backup files still hold the old secrets. They are encrypted with your phrase; delete the ones you no longer need."
+    return 0
+  fi
+  warn "The new secrets did not work. Putting the old ones back ..."
+  (umask 077; cp .env.before-rotate .env); fix_env_perms
+  write_livekit_config
+  if compose up -d --force-recreate server livekit >/dev/null 2>&1 && wait_healthy 90; then
+    rm -f .env.before-rotate
+    warn "Back to how it was. Nothing was lost. See what went wrong with: ./rushlight logs server"
+  else
+    warn "I could not restart with the old secrets either. They are in .env (and .env.before-rotate). Run ./rushlight check and ./rushlight logs server."
+  fi
+  return 1
+}
+
+# Does LiveKit accept the key the server now holds? (A room list is the smallest question only a matching key can answer.)
+verify_livekit() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    if compose exec -T server node --input-type=module -e "
+      import { RoomServiceClient } from 'livekit-server-sdk'
+      const c = new RoomServiceClient('http://127.0.0.1:7880', process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET)
+      await c.listRooms()" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 # address: the computer moved to a new address on the network.
 cmd_address() {
   need_docker
@@ -632,6 +715,7 @@ rushlight status
 rushlight logs [server|livekit]
 rushlight check            look for problems, and say what to do about each
 rushlight address [ADDRESS]  this computer's network address changed
+rushlight rotate-secrets [--jwt] [--livekit] [--all] [--yes]   replace the sign-in and/or voice secrets, safely
 rushlight tailscale key [--authkey-file F]   sign this computer in to Tailscale again with a new key
 rushlight update [--version vX.Y.Z]   update safely (backup, copy of the data, and a way back if it does not start)
 rushlight backup setup|now|list|check FILE|export [FOLDER]   encrypted backups
@@ -649,6 +733,7 @@ case "${1:-help}" in
   check)   cmd_check ;;
   address) shift; cmd_address "$@" ;;
   update)  shift; cmd_update "$@" ;;
+  rotate-secrets) shift; cmd_rotate "$@" ;;
   tailscale) shift; cmd_tailscale "$@" ;;
   backup)  shift; cmd_backup "$@" ;;
   restore) shift; cmd_restore "$@" ;;

@@ -72,6 +72,20 @@ is given it, it is **emptied right after the first sign-in** and is not in `.env
 plan limits the number of devices, and everyone must install Tailscale. It is less private than Private mode and easier than
 Public mode. Voice travels over the same private network (LiveKit advertises the Tailscale address).
 
+## Replacing secrets (if one may have leaked)
+
+    ./rushlight rotate-secrets --livekit      # the voice key: calls reconnect by themselves
+    ./rushlight rotate-secrets --jwt          # the sign-in secret: EVERYONE is signed out and signs in again
+    ./rushlight rotate-secrets --all
+
+`--jwt` signs everyone out (their password signs them back in), guests must join again with their code, and any old sign-in token
+stops working. Chat, accounts, encryption keys and backups are untouched. The linked Jellyfin key stays readable (it is encrypted
+with its own `MUSIC_SECRET`, which `setup` now makes; an older install gets it pinned to the old sign-in secret). It makes an
+encrypted backup first, keeps the old `.env` until the new secrets are proven (the server answers and LiveKit accepts the new key),
+puts it back if they are not, and deletes it when they are. **Old backup files still contain the old secrets** (encrypted with your
+phrase): delete the ones you do not need. Your backup phrase and Tailscale or sslip/domain settings are not changed by this; a new
+backup phrase is `./rushlight backup` > `new-phrase`.
+
 ## Updating
 
     ./rushlight update                 # the newest of what you follow (stable)
