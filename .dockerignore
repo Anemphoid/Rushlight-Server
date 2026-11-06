@@ -1,0 +1,20 @@
+# Keep the image small and keep every secret and every database out of it.
+.git
+.github
+node_modules
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+backups/
+backup-public.key
+test/
+scripts/
+update.sh
+install-service.sh
+install-auto-update.sh
+docker/
+Dockerfile
+.dockerignore
