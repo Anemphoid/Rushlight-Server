@@ -40,6 +40,33 @@ lan_ip() {
 
 env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | head -n1 || true; }
 
+# The server runs as an ordinary user inside its container and has to read .env for the backups. When that user is not the
+# file's owner, widen the file itself and rely on this folder being closed to other accounts.
+fix_env_perms() {
+  chmod 700 "$HERE"
+  chmod 600 .env
+  [ "$(id -u)" = 1000 ] || chmod 644 .env
+}
+env_set() { # KEY VALUE (values here never contain slashes or ampersands that matter: versions, addresses)
+  local v="${2//\\/\\\\}"; v="${v//&/\\&}"; v="${v//|/\\|}"
+  if grep -q "^$1=" .env; then sed -i "s|^$1=.*|$1=$v|" .env; else printf '%s=%s\n' "$1" "$2" >> .env; fi
+}
+# (a RUSHLIGHT_IMAGE / RUSHLIGHT_VERSION in the environment wins over .env, as it does for Compose; a restore on a new computer has no .env yet)
+image_name() { local i="${RUSHLIGHT_IMAGE:-$(env_get RUSHLIGHT_IMAGE)}"; printf '%s' "${i:-ghcr.io/anemphoid/rushlight-server}"; }
+image_version() { local v="${RUSHLIGHT_VERSION:-$(env_get RUSHLIGHT_VERSION)}"; printf '%s' "${v:-stable}"; }
+
+# The data volume is made by Compose (project "rushlight", volume "data"). These helpers make sure it exists with Compose's labels
+# even on a computer that has not started the stack yet (a restore), and run one command against it with no network.
+VOLUME=rushlight_data
+ensure_volume() {
+  docker volume inspect "$VOLUME" >/dev/null 2>&1 || docker volume create --label com.docker.compose.project=rushlight --label com.docker.compose.volume=data "$VOLUME" >/dev/null
+}
+volrun() { # IMAGE command... (as the server's own user)
+  local image="$1"; shift
+  ensure_volume
+  docker run --rm --network none -v "$VOLUME:/data" --entrypoint "$1" "$image" "${@:2}"
+}
+
 valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
 cmd_setup() {
@@ -92,10 +119,7 @@ cmd_setup() {
     echo "LIVEKIT_API_SECRET=$(random_hex 32)"
   } > "$tmp"
   mv "$tmp" .env
-  # The server runs as an ordinary user inside its container and has to read this file for the backups. When that user is not
-  # the file's owner, widen the file itself and rely on this folder being closed to other accounts.
-  chmod 700 "$HERE"
-  [ "$(id -u)" = 1000 ] || chmod 644 .env
+  fix_env_perms
   write_livekit_config
   say "Secrets and settings written (not shown here; they are in .env)."
   if [ "$start" -eq 1 ]; then cmd_start; fi
@@ -125,7 +149,7 @@ cmd_start() {
   need_docker
   [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
   [ -f livekit.yaml ] || write_livekit_config
-  compose pull --quiet 2>/dev/null || warn "Could not download images (offline?). Using the ones already here."
+  # No pull here on purpose: only ./rushlight update changes versions, so a restart can never move you onto a new one.
   compose up -d
   say "Waiting for the server to answer..."
   if wait_healthy 90; then
@@ -201,6 +225,129 @@ cmd_check() {
   exit "$bad"
 }
 
+# update [--version vX.Y.Z]: a safe update. Downloads first (nothing changes if that fails), makes an encrypted backup if they are
+# set up, keeps a plain copy of the database as the way back, switches, waits for the server to answer, and if it does not, puts the
+# old version and the old data back.
+cmd_update() {
+  local version="" 
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) version="${2:-}"; shift 2 ;;
+      *) die "I do not know '$1'. Try ./rushlight help." ;;
+    esac
+  done
+  need_docker
+  [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  local img cur target old_id new_id
+  img="$(image_name)"; cur="$(image_version)"; target="${version:-$cur}"
+  old_id="$(docker image inspect -f '{{.Id}}' "$img:$cur" 2>/dev/null || true)"
+  [ -n "$old_id" ] || old_id="$(docker inspect -f '{{.Image}}' "$(compose ps -q server 2>/dev/null | head -n1)" 2>/dev/null || true)"
+
+  say "Downloading $img:$target ..."
+  docker pull "$img:$target" >/dev/null 2>&1 || docker image inspect "$img:$target" >/dev/null 2>&1 || die "I could not download $img:$target (no internet, or no such version). Nothing was changed."
+  new_id="$(docker image inspect -f '{{.Id}}' "$img:$target")"
+  if [ "$new_id" = "$old_id" ] && [ "$target" = "$cur" ]; then say "Already up to date ($cur)."; return 0; fi
+
+  if compose exec -T server test -f /data/backup-public.key >/dev/null 2>&1; then
+    say "Making an encrypted backup first ..."
+    compose exec -T server node src/backup-cli.js now || die "The backup failed, so I did not update. Fix that ('./rushlight backup list') or ask for help."
+  else
+    note_line "Encrypted backups are not set up (./rushlight backup setup). A plain safety copy is made anyway, and removed when the update works."
+  fi
+
+  local helper="${old_id:-$img:$target}"
+  say "Stopping the server and keeping a copy of the data ..."
+  compose stop server >/dev/null
+  volrun "$helper" sh -c 'rm -rf /data/rollback && mkdir /data/rollback && cp -p /data/rushlight.db* /data/rollback/' || { compose up -d server >/dev/null 2>&1 || true; die "I could not make the safety copy, so nothing was changed."; }
+
+  env_set RUSHLIGHT_VERSION "$target"
+  say "Starting $target ..."
+  compose up -d server >/dev/null
+  if wait_healthy "${RUSHLIGHT_UPDATE_WAIT:-90}"; then
+    volrun "$helper" rm -rf /data/rollback >/dev/null 2>&1 || true
+    say "Updated to $target. Rushlight is running at http://$(env_get HOST_IP):$(env_get PORT)"
+    return 0
+  fi
+
+  warn "The new version did not start properly. Putting the old version and your data back ..."
+  compose stop server >/dev/null 2>&1 || true
+  volrun "$helper" sh -c 'rm -f /data/rushlight.db* && cp -p /data/rollback/rushlight.db* /data/' || die "I could not put the data back. It is safe in the volume $VOLUME, in /data/rollback. Ask for help before doing anything else."
+  env_set RUSHLIGHT_VERSION "$cur"
+  if [ -n "$old_id" ]; then docker tag "$old_id" "$img:$cur"; fi
+  compose up -d server >/dev/null
+  if wait_healthy 60; then
+    volrun "$helper" rm -rf /data/rollback >/dev/null 2>&1 || true
+    warn "Rolled back: Rushlight is running the old version ($cur) again, with your data as it was. Nothing was lost."
+    warn "See what went wrong with: ./rushlight logs server"
+  else
+    warn "The old version did not start either. Your data is safe (encrypted backups, and the copy in /data/rollback). Run ./rushlight check and ./rushlight logs server."
+  fi
+  return 1
+}
+note_line() { say "note     $*"; }
+
+# backup ...: the server's own backup tool (see docs/backups.md), run inside the container. Plus `backup export` to copy the newest
+# backup file out of the container, onto this computer's disk, so it can be put somewhere else.
+cmd_backup() {
+  need_docker
+  case "${1:-}" in
+    export)
+      local name dest="${2:-.}"
+      name="$(compose exec -T server sh -c 'ls -1 /data/backups 2>/dev/null' | tr -d '\r' | grep '\.rlbak$' | sort | tail -n1 || true)"
+      [ -n "$name" ] || die "There are no backups yet. Make one with: ./rushlight backup now"
+      compose cp "server:/data/backups/$name" "$dest/$name"
+      say "Copied $name to $dest. It is encrypted: keep it somewhere that is not on this computer."
+      ;;
+    "") die "Try: ./rushlight backup setup | now | list | check FILE | export [FOLDER]" ;;
+    *) compose exec server node src/backup-cli.js "$@" ;;
+  esac
+}
+
+# restore FILE.rlbak: put a backup back (asks for the 12 words). Works on a computer that has never run Rushlight: the backup carries
+# the .env, so the secrets (and everyone's sign-ins) come back with it. The data it replaces is kept in the volume in /data/before-restore.
+cmd_restore() {
+  local file="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) file="$1"; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die "Give the backup file: ./rushlight restore /path/to/rushlight-2026-01-01.rlbak"
+  [ -f "$file" ] || die "I cannot find $file."
+  need_docker
+  file="$(readlink -f "$file")"
+  local img ver; img="$(image_name)"; ver="$(image_version)"
+  docker image inspect "$img:$ver" >/dev/null 2>&1 || docker pull "$img:$ver" >/dev/null || die "I could not download $img:$ver."
+  if [ -f .env ] && [ "$yes" -ne 1 ]; then
+    say "This REPLACES the server's data and settings with what is in the backup. What is here now is kept (data: inside the Docker volume, in /data/before-restore; settings: .env.before-restore)."
+    printf 'Go ahead? [y/N] '; read -r answer || answer=n
+    case "${answer:-N}" in [Yy]*) ;; *) say "Nothing was changed."; exit 0 ;; esac
+  fi
+  local had_env=0 keep_img="" keep_ver="" keep_lk=""
+  if [ -f .env ]; then had_env=1; keep_img="$(env_get RUSHLIGHT_IMAGE)"; keep_ver="$(env_get RUSHLIGHT_VERSION)"; keep_lk="$(env_get LIVEKIT_VERSION)"; compose stop server >/dev/null 2>&1 || true; fi
+  volrun "$img:$ver" sh -c 'rm -rf /data/restore-tmp /data/before-restore; if [ -f /data/rushlight.db ]; then mkdir /data/before-restore && cp -p /data/rushlight.db* /data/before-restore/; fi'
+  local tty=(-i); [ -t 0 ] && tty=(-it)
+  docker run --rm "${tty[@]}" --network none -v "$VOLUME:/data" -v "$file:/in/backup.rlbak:ro" --entrypoint node "$img:$ver" src/backup-cli.js restore /in/backup.rlbak /data/restore-tmp \
+    || { volrun "$img:$ver" rm -rf /data/restore-tmp >/dev/null 2>&1 || true; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "The backup was not restored (wrong words, or a damaged file). Nothing was changed."; }
+  (umask 077; volrun "$img:$ver" cat /data/restore-tmp/restored.env > .env.restored)
+  [ -s .env.restored ] || { rm -f .env.restored; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "That backup holds no settings file. Nothing was changed."; }
+  volrun "$img:$ver" sh -c 'rm -f /data/rushlight.db* && mv /data/restore-tmp/rushlight.db /data/rushlight.db && rm -rf /data/restore-tmp'
+  [ ! -f .env ] || mv .env .env.before-restore
+  mv .env.restored .env
+  fix_env_perms
+  # keep the versions this computer was running (the backup may be from an older one); a new computer takes the backup's
+  if [ "$had_env" -eq 1 ]; then
+    [ -z "$keep_img" ] || env_set RUSHLIGHT_IMAGE "$keep_img"
+    [ -z "$keep_ver" ] || env_set RUSHLIGHT_VERSION "$keep_ver"
+    [ -z "$keep_lk" ] || env_set LIVEKIT_VERSION "$keep_lk"
+  fi
+  local ip; ip="$(lan_ip)"; [ -z "$ip" ] || env_set HOST_IP "$ip"
+  write_livekit_config
+  say "Restored. Starting ..."
+  cmd_start
+}
+
 # address: the computer moved to a new address on the network.
 cmd_address() {
   need_docker
@@ -224,6 +371,9 @@ rushlight status
 rushlight logs [server|livekit]
 rushlight check            look for problems, and say what to do about each
 rushlight address [ADDRESS]  this computer's network address changed
+rushlight update [--version vX.Y.Z]   update safely (backup, copy of the data, and a way back if it does not start)
+rushlight backup setup|now|list|check FILE|export [FOLDER]   encrypted backups
+rushlight restore FILE.rlbak   put a backup back (also onto a new computer)
 TXT
 }
 
@@ -236,6 +386,9 @@ case "${1:-help}" in
   logs)    shift; cmd_logs "$@" ;;
   check)   cmd_check ;;
   address) shift; cmd_address "$@" ;;
+  update)  shift; cmd_update "$@" ;;
+  backup)  shift; cmd_backup "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
   help|-h|--help) cmd_help ;;
   *) die "I do not know '$1'. Try ./rushlight help." ;;
 esac

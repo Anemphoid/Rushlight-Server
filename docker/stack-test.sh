@@ -51,6 +51,49 @@ curl -fsS -m 10 -H 'content-type: application/json' -d "{\"username\":\"$U\",\"p
 "$R" stop >/dev/null 2>&1
 "$R" start >/dev/null 2>&1 && pass "stop then start works" || fail "start after stop failed"
 
+
+# ---- backups, updates and the way back ----
+api_post() { curl -fsS -m 10 -H 'content-type: application/json' -d "$2" "http://$IP:$PORT$1"; }
+can_login() { api_post /api/login "{\"username\":\"$1\",\"password\":\"password123\"}" >/dev/null 2>&1; }
+wait_up() { for _ in $(seq 1 60); do curl -fsS -m 3 "http://$IP:$PORT/api/health" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+env_val() { sed -n "s/^$1=//p" "$DIR/.env" | head -n1; }
+
+# encrypted backups: turn them on the way setup would, with a throwaway phrase (the real command asks questions)
+PHRASE="$(cd "$DIR" && docker compose exec -T server node --input-type=module -e "
+import { makePhrase, keysFromPhrase, writePublicKeyFile } from './src/backup.js'
+const p = makePhrase(); writePublicKeyFile('/data/backup-public.key', keysFromPhrase(p).publicRaw); console.log(p)" | tail -n1 | tr -d '\r')"
+[ "$(wc -w <<<"$PHRASE")" = 12 ] || fail "could not turn backups on"
+"$R" backup now >/dev/null 2>&1 && "$R" backup list 2>&1 | grep -q 'rushlight-' && pass "an encrypted backup is made inside the stack and listed" || fail "backup now / list failed"
+mkdir "$DIR/export" && "$R" backup export "$DIR/export" >/dev/null 2>&1 && ls "$DIR"/export/*.rlbak >/dev/null 2>&1 && pass "the newest backup can be copied out of the container" || fail "backup export failed"
+grep -qaF "$(env_val JWT_SECRET)" "$DIR"/export/*.rlbak && fail "the backup file holds the secret in the clear" || pass "the backup file does not show the secret"
+
+# an update that works: same image under a new tag is a real version change as far as the program can tell
+docker tag "$IMAGE" "${IMAGE%:*}:next"
+"$R" update --version next >"$DIR/update.out" 2>&1 || { cat "$DIR/update.out" >&2; fail "a good update did not finish"; }
+[ "$(env_val RUSHLIGHT_VERSION)" = next ] && can_login "$U" && pass "update to a new version works and keeps the data" || fail "update lost the version or the data"
+grep -qi 'encrypted backup' "$DIR/update.out" && pass "update made an encrypted backup first" || fail "update did not back up first"
+if (cd "$DIR" && docker run --rm --network none -v rushlight_data:/data --entrypoint sh "${IMAGE%:*}:next" -c 'test -d /data/rollback'); then fail "the safety copy was left behind"; else pass "the safety copy is removed after a good update"; fi
+"$R" update --version next 2>&1 | grep -q 'Already up to date' && pass "updating again says it is already current" || fail "no up-to-date message"
+
+# an update that does not start: the new version breaks the database and exits; the old version and data must come back
+printf 'FROM %s\nCMD ["sh","-c",": > /data/rushlight.db; exit 1"]\n' "${IMAGE%:*}:next" | docker build -q -t "${IMAGE%:*}:broken" - >/dev/null
+if RUSHLIGHT_UPDATE_WAIT=15 "$R" update --version broken >"$DIR/rollback.out" 2>&1; then fail "a broken update was reported as fine"; fi
+grep -q 'Rolled back' "$DIR/rollback.out" || { cat "$DIR/rollback.out" >&2; fail "the rollback did not happen"; }
+[ "$(env_val RUSHLIGHT_VERSION)" = next ] && wait_up && can_login "$U" && pass "a broken update is rolled back: old version running, data intact" || fail "rollback left the stack broken"
+
+# restore into the same stack, then onto a "new computer" (no .env)
+EXTRA="late$RANDOM"
+api_post /api/register "{\"username\":\"$EXTRA\",\"password\":\"password123\"}" >/dev/null
+JWT_BEFORE="$(env_val JWT_SECRET)"
+echo "$PHRASE" | "$R" restore --yes "$(ls "$DIR"/export/*.rlbak | head -n1)" >"$DIR/restore.out" 2>&1 || { cat "$DIR/restore.out" >&2; fail "restore failed"; }
+wait_up && can_login "$U" && ! can_login "$EXTRA" && pass "restore brings back the data as it was at the backup (later changes gone)" || fail "restore did not give back the backed-up state"
+[ -f "$DIR/.env.before-restore" ] && pass "the settings in place before the restore are kept" || fail "no .env.before-restore"
+if echo "wrong words wrong words wrong words wrong words wrong words wrong words" | "$R" restore --yes "$(ls "$DIR"/export/*.rlbak | head -n1)" >"$DIR/badphrase.out" 2>&1; then fail "restore accepted wrong words"; fi
+wait_up && can_login "$U" && pass "wrong words change nothing" || fail "a failed restore broke the stack"
+"$R" stop >/dev/null 2>&1; rm -f "$DIR/.env" "$DIR/livekit.yaml" "$DIR/.env.before-restore"
+echo "$PHRASE" | RUSHLIGHT_IMAGE="${IMAGE%:*}" RUSHLIGHT_VERSION=next "$R" restore "$(ls "$DIR"/export/*.rlbak | head -n1)" >"$DIR/fresh.out" 2>&1 || { cat "$DIR/fresh.out" >&2; fail "restore with no .env failed"; }
+[ "$(env_val JWT_SECRET)" = "$JWT_BEFORE" ] && wait_up && can_login "$U" && pass "restoring on a computer with no settings brings the secrets back too" || fail "fresh restore did not bring back the secrets"
+
 (cd "$DIR" && docker compose stop livekit >/dev/null 2>&1)
 if "$R" check >"$DIR/broken.out" 2>&1; then fail "check passed with voice stopped"; fi
 grep -q 'PROBLEM  The voice container' "$DIR/broken.out" && pass "check says so when voice is stopped" || { cat "$DIR/broken.out" >&2; fail "check did not name the voice problem"; }
