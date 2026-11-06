@@ -4,6 +4,8 @@ This is step 2 of the Compose packaging: **Private mode** (people on your own ne
 Public mode (a domain and HTTPS), Tailscale mode and key rotation come in later steps. A beginner's guide is
 written last, from real runs.
 
+Step-by-step guides for beginners, with an advanced track, are in [guides/](guides/README.md).
+
 ## What you get
 
 Two containers sharing the computer's network: the Rushlight server (port 4000) and LiveKit (voice: 7880 and 7881 over TCP, **one
@@ -11,7 +13,7 @@ UDP port, 7882**). Open those ports on a firewall that is in the way. The data i
 
 ## First time
 
-    docker run --rm -v "$PWD":/out --entrypoint sh ghcr.io/anemphoid/rushlight-server:stable -c 'cp -r /app/deploy/. /out/'
+    docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/out --entrypoint sh ghcr.io/anemphoid/rushlight-server:stable -c 'cp -r /app/deploy/. /out/'
     ./rushlight setup
 
 `setup` finds this computer's address (or take one with `--ip`), makes the secrets from the system's random source, writes them to
