@@ -68,7 +68,9 @@ P="$(port)"
 TOKEN="$(api -X POST "http://127.0.0.1:$P/api/register" -d '{"username":"smoketest","password":"correct horse battery"}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
 [ -n "$TOKEN" ] && pass "an account can be made" || fail "could not register"
 
-docker exec "$NAME" node src/backup-cli.js list 2>&1 | grep -q "not set up" && pass "the backup tool runs inside the container" || fail "the backup tool did not run"
+# (read the output first: "grep -q" quitting early would break the pipe and fail the check by chance)
+backup_out="$(docker exec "$NAME" node src/backup-cli.js list 2>&1 || true)"
+grep -q "not set up" <<<"$backup_out" && pass "the backup tool runs inside the container" || fail "the backup tool did not run"
 
 # the data survives the container being stopped and started again
 t0=$(date +%s)
@@ -80,6 +82,7 @@ wait_healthy && pass "starts again" || fail "did not come back after a restart"
 P="$(port)"
 api -X POST "http://127.0.0.1:$P/api/login" -d '{"username":"smoketest","password":"correct horse battery"}' >/dev/null && pass "the account is still there after a restart (the volume holds the data)" || fail "the account was lost on restart"
 
-if docker logs "$NAME" 2>&1 | grep -qF -e "$JWT" -e "$LIVEKIT_SECRET"; then fail "a secret is in the log"; fi
+log_out="$(docker logs "$NAME" 2>&1)"
+if grep -qF -e "$JWT" -e "$LIVEKIT_SECRET" <<<"$log_out"; then fail "a secret is in the log"; fi
 pass "no secret in the log"
 echo "All checks passed."
