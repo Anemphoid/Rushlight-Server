@@ -39,6 +39,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY package.json LICENSE ./
 COPY src ./src
 COPY docs ./docs
+# the Compose stack (the `rushlight` program and its files), so the image carries what sets it up
+COPY deploy ./deploy
 
 ENV NODE_ENV=production \
     PORT=4000 \
