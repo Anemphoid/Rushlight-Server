@@ -28,8 +28,11 @@ LiveKit is a separate program that is **not bundled** with this server; see
 `.env` needs `JWT_SECRET` (generate with
 `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`) and
 `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` from your LiveKit
-config. `LIVEKIT_URL` is handed to clients as-is, so it must be an address every
-client can reach.
+config. `LIVEKIT_URL` is the address this server uses to reach LiveKit. Clients are
+given the address they used to reach this server, with LiveKit's port, when
+`LIVEKIT_URL` is a plain `ws://` IP address or `localhost`; so if the machine's IP
+changes, only the address in the app changes and voice follows. Otherwise (a name,
+`wss://`, a reverse proxy) set `LIVEKIT_PUBLIC_URL` to what clients should use.
 
 Check it from another machine: `curl http://<host>:4000/api/health` returns
 `{"ok":true}`.

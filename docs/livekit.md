@@ -79,9 +79,17 @@ LIVEKIT_API_SECRET=the-same-secret-as-in-livekit.yaml
 
 Then restart the Rushlight server (`systemctl restart rushlight-server`).
 
-- `LIVEKIT_URL` is given to every client as written, so it must be an address
-  **every client can reach**, not `localhost` unless everyone is on that machine.
-- The Rushlight server also uses it, so it has to be reachable from there too.
+- `LIVEKIT_URL` is the address the Rushlight server uses to reach LiveKit.
+- Clients are told to connect to the address they used to reach the Rushlight server,
+  with LiveKit's port, when `LIVEKIT_URL` is a plain `ws://` IP address or `localhost`.
+  So a client that reaches the server at `192.168.70.15:4000` connects to LiveKit at
+  `ws://192.168.70.15:7880`, and moving the server only means changing the address in
+  the app. LiveKit's port must be reachable at that address (and, for people outside
+  the network, so must its media ports; see the TURN notes).
+- When LiveKit is on a name of its own, behind a reverse proxy, or uses `wss://`, set
+  `LIVEKIT_PUBLIC_URL` (for example `wss://livekit.example.com`) to exactly what
+  clients should use. It wins over everything above. Without it, those setups hand
+  clients `LIVEKIT_URL` as written, as before.
 - Use `wss://` if LiveKit is behind a reverse proxy that provides HTTPS. Use
   `ws://` if it is not. Browsers and apps on the open internet should use `wss://`.
 
