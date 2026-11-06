@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+# rushlight: set up and run a Rushlight server with Docker Compose (Linux).
+#
+#   ./rushlight setup      first time: make the secrets and settings, then start
+#   ./rushlight start | stop | restart | status | logs [server|livekit]
+#   ./rushlight check      look for problems and say what to do about each
+#
+# Everything lives in the folder this file is in: compose.yaml, .env (the secrets: keep it private), livekit.yaml.
+# The server's data is in a Docker volume called rushlight_data.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+cd "$HERE"
+
+DEFAULT_LIVEKIT_VERSION="v1.13.11"
+DEFAULT_CADDY_VERSION="2.11.9"
+DEFAULT_TAILSCALE_VERSION="v1.104.4"
+SERVER_PORT_DEFAULT=4000
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die()  { warn "Problem: $*"; exit 1; }
+
+compose() { docker compose --project-directory "$HERE" -f "$HERE/compose.yaml" "$@"; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it from https://docs.docker.com/engine/install/ and run this again."
+  docker compose version >/dev/null 2>&1 || die "Docker is here but 'docker compose' is not. Install the Docker Compose plugin (https://docs.docker.com/compose/install/linux/)."
+  local cv; cv="$(docker compose version --short 2>/dev/null | sed 's/^v//' || true)"
+  if [[ "$cv" =~ ^([0-9]+)\.([0-9]+) ]] && { [ "${BASH_REMATCH[1]}" -lt 2 ] || { [ "${BASH_REMATCH[1]}" -eq 2 ] && [ "${BASH_REMATCH[2]}" -lt 24 ]; }; }; then
+    die "Your Docker Compose ($cv) is too old; Rushlight needs 2.24 or newer. Update the Docker Compose plugin (https://docs.docker.com/compose/install/linux/)."
+  fi
+  docker info >/dev/null 2>&1 || die "Docker is installed but not running, or you are not allowed to use it. Try 'sudo systemctl start docker', and add yourself to the docker group ('sudo usermod -aG docker \$USER', then log out and in)."
+}
+
+random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+lan_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
+  fi
+  [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+  printf '%s' "$ip"
+}
+
+env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | head -n1 || true; }
+
+# The server runs as an ordinary user inside its container and has to read .env for the backups. When that user is not the
+# file's owner, widen the file itself and rely on this folder being closed to other accounts.
+fix_env_perms() {
+  chmod 700 "$HERE"
+  chmod 600 .env
+  [ "$(id -u)" = 1000 ] || chmod 644 .env
+}
+env_set() { # KEY VALUE (values here never contain slashes or ampersands that matter: versions, addresses)
+  local v="${2//\\/\\\\}"; v="${v//&/\\&}"; v="${v//|/\\|}"
+  if grep -q "^$1=" .env; then sed -i "s|^$1=.*|$1=$v|" .env; else printf '%s=%s\n' "$1" "$2" >> .env; fi
+}
+# (a RUSHLIGHT_IMAGE / RUSHLIGHT_VERSION in the environment wins over .env, as it does for Compose; a restore on a new computer has no .env yet)
+image_name() { local i="${RUSHLIGHT_IMAGE:-$(env_get RUSHLIGHT_IMAGE)}"; printf '%s' "${i:-ghcr.io/anemphoid/rushlight-server}"; }
+image_version() { local v="${RUSHLIGHT_VERSION:-$(env_get RUSHLIGHT_VERSION)}"; printf '%s' "${v:-stable}"; }
+
+# The data volume is made by Compose (project "rushlight", volume "data"). These helpers make sure it exists with Compose's labels
+# even on a computer that has not started the stack yet (a restore), and run one command against it with no network.
+VOLUME=rushlight_data
+ensure_volume() {
+  docker volume inspect "$VOLUME" >/dev/null 2>&1 || docker volume create --label com.docker.compose.project=rushlight --label com.docker.compose.volume=data "$VOLUME" >/dev/null
+}
+volrun() { # IMAGE command... (as the server's own user)
+  local image="$1"; shift
+  ensure_volume
+  docker run --rm --network none -v "$VOLUME:/data" --entrypoint "$1" "$image" "${@:2}"
+}
+
+valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+cmd_setup() {
+  local mode=private ip="" port="$SERVER_PORT_DEFAULT" yes=0 start=1 version="" lkversion="$DEFAULT_LIVEKIT_VERSION" image=""
+  local domain="" sslip=0 public_ip="" email="" tls="" keyfile="" tsname="rushlight"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ip) ip="${2:-}"; shift 2 ;;
+      --port) port="${2:-}"; shift 2 ;;
+      --yes) yes=1; shift ;;
+      --no-start) start=0; shift ;;
+      --version) version="${2:-}"; shift 2 ;;
+      --image) image="${2:-}"; shift 2 ;;
+      --livekit-version) lkversion="${2:-}"; shift 2 ;;
+      --domain) domain="${2:-}"; shift 2 ;;
+      --sslip) sslip=1; shift ;;
+      --public-ip) public_ip="${2:-}"; shift 2 ;;
+      --email) email="${2:-}"; shift 2 ;;
+      --tls-internal) tls=internal; shift ;;   # a certificate made on this computer: for tests only, people's apps will not trust it
+      private) mode=private; shift ;;
+      public) mode=public; shift ;;
+      tailscale) mode=tailscale; shift ;;
+      --authkey-file) keyfile="${2:-}"; shift 2 ;;
+      --name) tsname="${2:-}"; shift 2 ;;
+      *) die "I do not know '$1'. Try ./rushlight help." ;;
+    esac
+  done
+  need_docker
+  if [ -f .env ]; then
+    die "This folder is already set up (.env exists). Use './rushlight start', or './rushlight check' to see how it is doing. Setting up again would replace the secrets and sign everyone out, so I will not do it."
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "The port '$port' is not a number from 1 to 65535."
+
+  local host="" kind="" tskey=""
+  if [ "$mode" = private ]; then
+    [ -n "$ip" ] || ip="$(lan_ip)"
+    [ -n "$ip" ] || die "I could not work out this computer's network address. Run again with --ip followed by it, for example: ./rushlight setup --ip 192.168.1.20"
+    valid_ip "$ip" || die "'$ip' does not look like an address such as 192.168.1.20."
+    say "Setting up a Private Rushlight server."
+    say "  Address people will use: http://$ip:$port  (only people on your network, or connected to it, can reach it)"
+  elif [ "$mode" = tailscale ]; then
+    [[ "$tsname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die "'$tsname' is not a good device name. Use letters, numbers and dashes, for example: rushlight"
+    tskey="$(read_authkey "$keyfile")"
+    say "Setting up a Rushlight server on Tailscale."
+    say "  This computer joins your Tailscale network (your \"tailnet\") as '$tsname'. People reach Rushlight at that machine's Tailscale"
+    say "  address, from any device on the tailnet or that you share this machine with. Nothing is opened to the internet."
+    say "  The trade-off, plainly: Tailscale's own service knows which of your devices connect to which, the free plan has a limit on"
+    say "  devices, and everyone needs Tailscale installed. In return there is no router setup and no domain."
+  else
+    if [ -n "$domain" ]; then
+      [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || die "'$domain' does not look like a domain name such as chat.example.com."
+      host="$domain"; kind=domain
+      ip="$public_ip"
+      [ -n "$ip" ] || ip="$(resolve_ipv4 "$host")"
+      [ -n "$ip" ] || die "$host does not point anywhere yet. In your domain's DNS settings add an A record for $host with this computer's public address, wait a few minutes, and run this again."
+    elif [ "$sslip" -eq 1 ]; then
+      ip="$public_ip"
+      [ -n "$ip" ] || ip="$(detect_public_ip)"
+      [ -n "$ip" ] || die "I could not find this computer's public address. Run again with --public-ip followed by it (search the web for 'what is my IP')."
+      valid_ip "$ip" || die "'$ip' does not look like an address such as 203.0.113.7."
+      host="${ip//./-}.sslip.io"; kind=sslip
+    else
+      die "Public mode needs a name people can reach you by. Use --domain chat.example.com (best), or --sslip to use a free name made from your address."
+    fi
+    valid_ip "$ip" || die "'$ip' does not look like an address such as 203.0.113.7."
+    say "Setting up a Public Rushlight server."
+    say "  People will connect to: https://$host"
+    say "  This computer's public address: $ip"
+    if [ "$kind" = sslip ]; then
+      say "  Note: $host is a free name from the sslip.io service. It works with no domain of your own, but it changes whenever your"
+      say "  address does (everyone would have to change it in their app), and it depends on that service staying up. A domain you own is better."
+    fi
+    say "  You must open these on your router/firewall and send them to this computer:"
+    say "     80 and 443 (TCP)  the website and its certificate;  7881 (TCP), 7882 (UDP) and 3478 (UDP)  voice"
+    say "  Do NOT open $port: only the web server on 443 should be reachable."
+  fi
+  if [ "$yes" -ne 1 ]; then
+    printf 'Go ahead? [Y/n] '; read -r answer || answer=n
+    case "${answer:-Y}" in [Nn]*) say "Nothing was changed."; exit 0 ;; esac
+  fi
+
+  umask 077
+  local tmp; tmp="$(mktemp .env.XXXXXX)"
+  {
+    echo "# Written by ./rushlight setup. These are your server's secrets: keep this file private and never share it."
+    echo "# It is included in the server's encrypted backups, so a restored server keeps them."
+    echo "RUSHLIGHT_MODE=$mode"
+    [ -z "$image" ] || echo "RUSHLIGHT_IMAGE=$image"
+    echo "RUSHLIGHT_VERSION=${version:-stable}"
+    echo "LIVEKIT_VERSION=$lkversion"
+    echo "HOST_IP=${ip:-pending}"
+    echo "PORT=$port"
+    echo "JWT_SECRET=$(random_hex 48)"
+    echo "LIVEKIT_URL=ws://127.0.0.1:7880"
+    echo "LIVEKIT_API_KEY=API$(random_hex 8)"
+    echo "LIVEKIT_API_SECRET=$(random_hex 32)"
+    echo "# Encrypts the Jellyfin key (Jellybox) at rest. Its own secret, so changing JWT_SECRET never makes a linked library unreadable."
+    echo "MUSIC_SECRET=$(random_hex 32)"
+    if [ "$mode" = tailscale ]; then
+      echo "# Tailscale mode: the tailscale container is started with the profile below; HOST_IP is this computer's Tailscale address,"
+      echo "# filled in when it has joined. (The one-time sign-in key is in tailscale.env, not here, and is emptied after use.)"
+      echo "COMPOSE_PROFILES=tailscale"
+      echo "TAILSCALE_VERSION=$DEFAULT_TAILSCALE_VERSION"
+      echo "TS_HOSTNAME=$tsname"
+    fi
+    if [ "$mode" = public ]; then
+      echo "# Public mode: Caddy (the web server that gets the HTTPS certificate) is started with the profile below."
+      echo "COMPOSE_PROFILES=public"
+      echo "CADDY_VERSION=$DEFAULT_CADDY_VERSION"
+      echo "PUBLIC_HOST=$host"
+      echo "PUBLIC_HOST_KIND=$kind"
+      echo "ACME_EMAIL=$email"
+      echo "TLS_MODE=$tls"
+      echo "LIVEKIT_PUBLIC_URL=wss://$host"
+      # the server is behind Caddy, so the real address of each visitor comes from the header Caddy sets
+      echo "TRUST_PROXY=1"
+    fi
+  } > "$tmp"
+  mv "$tmp" .env
+  fix_env_perms
+  if [ "$mode" = tailscale ]; then write_ts_key "$tskey"; fi
+  write_configs
+  say "Secrets and settings written (not shown here; they are in .env)."
+  if [ "$start" -eq 1 ]; then cmd_start; fi
+}
+
+# The one-time sign-in key for Tailscale: from a file, from $TS_AUTHKEY, or typed without echo. Never taken from the command line,
+# where other accounts on this computer could read it.
+read_authkey() {
+  local key=""
+  if [ -n "${1:-}" ]; then [ -f "$1" ] || die "I cannot find the key file $1."; key="$(tr -d '[:space:]' < "$1")"
+  elif [ -n "${TS_AUTHKEY:-}" ]; then key="$TS_AUTHKEY"
+  elif [ -t 0 ]; then
+    say "Paste your Tailscale auth key (made at https://login.tailscale.com/admin/settings/keys). You will not see it as you type." >&2
+    printf 'Key: ' >&2; read -rs key || true; printf '\n' >&2
+  else die "I need a Tailscale auth key: put it in a file and use --authkey-file FILE (or run this in a terminal and paste it)."
+  fi
+  [[ "$key" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || die "That does not look like a Tailscale auth key (it starts with tskey-). Make one at https://login.tailscale.com/admin/settings/keys"
+  printf '%s' "$key"
+}
+write_ts_key() { (umask 077; printf 'TS_AUTHKEY=%s\n' "$1" > tailscale.env); }
+clear_ts_key() { (umask 077; printf '# the one-time key was used and removed\n' > tailscale.env); }
+
+# Join the tailnet (the container signs in with the key) and learn this computer's Tailscale address, which LiveKit has to advertise.
+tailscale_connect() {
+  [ -f tailscale.env ] || clear_ts_key
+  compose up -d tailscale >/dev/null
+  say "Joining Tailscale ..."
+  local i ip=""
+  for ((i = 0; i < ${RUSHLIGHT_TS_WAIT:-90}; i++)); do
+    ip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    valid_ip "$ip" && break
+    ip=""; sleep 1
+  done
+  if [ -z "$ip" ]; then
+    warn "This computer did not join Tailscale. The key may be wrong, expired or already used, or Tailscale cannot be reached."
+    warn "Make a new key at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    warn "('./rushlight logs tailscale' shows what Tailscale said.)"
+    return 1
+  fi
+  env_set HOST_IP "$ip"
+  write_configs
+  clear_ts_key
+  say "Joined Tailscale as $ip"
+}
+
+cmd_tailscale() {
+  case "${1:-}" in
+    key)
+      need_docker
+      [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] || die "This server is not in Tailscale mode."
+      shift; local keyfile=""; [ "${1:-}" != --authkey-file ] || keyfile="${2:-}"
+      write_ts_key "$(read_authkey "$keyfile")"
+      compose up -d --force-recreate tailscale >/dev/null
+      tailscale_connect && cmd_start
+      ;;
+    *) die "Try: ./rushlight tailscale key" ;;
+  esac
+}
+
+resolve_ipv4() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}' || true; }
+detect_public_ip() {
+  local ip
+  for url in https://api.ipify.org https://ifconfig.me/ip; do
+    ip="$(curl -4 -fsS -m 6 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    valid_ip "$ip" && { printf '%s' "$ip"; return; }
+  done
+}
+
+write_configs() {
+  # Tailscale mode: nothing to write until the computer has joined and has its address
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] && ! valid_ip "$(env_get HOST_IP)"; then return 0; fi
+  write_livekit_config
+  if [ "$(env_get RUSHLIGHT_MODE)" = public ]; then write_caddyfile; fi
+}
+
+write_livekit_config() {
+  local ip key secret mode host
+  ip="$(env_get HOST_IP)"; key="$(env_get LIVEKIT_API_KEY)"; secret="$(env_get LIVEKIT_API_SECRET)"; mode="$(env_get RUSHLIGHT_MODE)"; host="$(env_get PUBLIC_HOST)"
+  [ -n "$ip" ] && [ -n "$key" ] && [ -n "$secret" ] || die ".env is missing HOST_IP or the LiveKit key. Restore it from a backup, or move this folder aside and set up again."
+  local tmp; tmp="$(mktemp livekit.yaml.XXXXXX)"
+  {
+    echo "# Written by ./rushlight (do not edit; it is made again from .env)."
+    echo "port: 7880"
+    if [ "$mode" = public ]; then
+      echo "# Signalling is reached through Caddy (https, path /rtc) and nowhere else."
+      echo 'bind_addresses: ["127.0.0.1"]'
+    fi
+    echo "rtc:"
+    echo "  tcp_port: 7881"
+    echo "  # One UDP port for all voice, so one port to open and nothing else."
+    echo "  udp_port: 7882"
+    echo "  use_external_ip: false"
+    echo "  node_ip: $ip"
+    if [ "$mode" = public ]; then
+      echo "# Built-in relay (TURN) for people whose network blocks direct voice, mostly mobile and office networks."
+      echo "turn:"
+      echo "  enabled: true"
+      echo "  domain: $host"
+      echo "  udp_port: 3478"
+      echo "  relay_range_start: 50000"
+      echo "  relay_range_end: 50100"
+    fi
+    echo "keys:"
+    echo "  $key: $secret"
+  } > "$tmp"
+  chmod 644 "$tmp"; mv "$tmp" livekit.yaml
+}
+
+write_caddyfile() {
+  local host port email tls tmp
+  host="$(env_get PUBLIC_HOST)"; port="$(env_get PORT)"; email="$(env_get ACME_EMAIL)"; tls="$(env_get TLS_MODE)"
+  [ -n "$host" ] || die ".env has no PUBLIC_HOST."
+  tmp="$(mktemp Caddyfile.XXXXXX)"
+  {
+    echo "# Written by ./rushlight (do not edit; it is made again from .env)."
+    echo "{"
+    echo "	admin off"
+    [ -z "$email" ] || echo "	email $email"
+    echo "}"
+    echo "$host {"
+    [ "$tls" != internal ] || echo "	tls internal"
+    echo "	# voice signalling (LiveKit) lives under /rtc; everything else is the Rushlight server"
+    echo "	@livekit path /rtc /rtc/*"
+    echo "	handle @livekit {"
+    echo "		reverse_proxy 127.0.0.1:7880"
+    echo "	}"
+    echo "	handle {"
+    echo "		reverse_proxy 127.0.0.1:${port:-4000}"
+    echo "	}"
+    echo "}"
+  } > "$tmp"
+  chmod 644 "$tmp"; mv "$tmp" Caddyfile
+}
+
+cmd_start() {
+  need_docker
+  [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ]; then tailscale_connect || return 1; fi
+  [ -f livekit.yaml ] || write_configs
+  [ "$(env_get RUSHLIGHT_MODE)" != public ] || [ -f Caddyfile ] || write_configs
+  # No pull here on purpose: only ./rushlight update changes versions, so a restart can never move you onto a new one.
+  compose up -d
+  say "Waiting for the server to answer..."
+  if wait_healthy 90; then
+    say "Rushlight is running at $(public_address)"
+  else
+    warn "The server did not answer within 90 seconds. Run './rushlight check' and './rushlight logs server'."
+    return 1
+  fi
+}
+
+public_address() {
+  if [ "$(env_get RUSHLIGHT_MODE)" = public ]; then printf 'https://%s' "$(env_get PUBLIC_HOST)"; else printf 'http://%s:%s' "$(env_get HOST_IP)" "$(env_get PORT)"; fi
+}
+
+wait_healthy() {
+  local port; port="$(env_get PORT)"; port="${port:-$SERVER_PORT_DEFAULT}"
+  local i
+  for ((i = 0; i < $1; i++)); do
+    if curl -fsS -m 3 "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+cmd_stop()    { need_docker; compose stop; }
+cmd_restart() { need_docker; compose restart; }
+cmd_logs()    { need_docker; compose logs --tail 200 -f "$@"; }
+
+cmd_status() {
+  need_docker
+  compose ps
+  local port; port="$(env_get PORT)"; port="${port:-$SERVER_PORT_DEFAULT}"
+  if curl -fsS -m 3 "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then say "The server answers."; else say "The server does not answer."; fi
+}
+
+# check: every line starts with ok / PROBLEM / note, and PROBLEM lines say what to do. Exit status 1 when any PROBLEM.
+cmd_check() {
+  local bad=0
+  ok()   { say "ok       $*"; }
+  prob() { say "PROBLEM  $*"; bad=1; }
+  note() { say "note     $*"; }
+
+  if ! command -v docker >/dev/null 2>&1; then prob "Docker is not installed. Install it: https://docs.docker.com/engine/install/"; exit 1; fi
+  ok "Docker is installed"
+  docker compose version >/dev/null 2>&1 && ok "Docker Compose is installed" || prob "Docker Compose is missing. Install the Compose plugin: https://docs.docker.com/compose/install/linux/"
+  docker info >/dev/null 2>&1 && ok "Docker is running and you may use it" || { prob "Docker is not running, or you are not allowed to use it ('sudo systemctl start docker'; 'sudo usermod -aG docker \$USER' then log out and in)"; exit 1; }
+
+  if [ -f .env ]; then ok "Settings file (.env) is there"; else prob "No .env. Run ./rushlight setup"; exit 1; fi
+  local key
+  for key in JWT_SECRET LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_URL HOST_IP PORT LIVEKIT_VERSION; do
+    [ -n "$(env_get "$key")" ] || prob ".env has no $key. Restore .env from your backup."
+  done
+  [ -f livekit.yaml ] && ok "LiveKit settings (livekit.yaml) are there" || prob "livekit.yaml is missing. './rushlight start' makes it again."
+
+  local port ip
+  port="$(env_get PORT)"; ip="$(env_get HOST_IP)"
+  local running; running="$(compose ps --status running --services 2>/dev/null | tr '\n' ' ')"
+  case "$running" in *server*) ok "The server container is running" ;; *) prob "The server container is not running. './rushlight start', then './rushlight logs server' if it stops again." ;; esac
+  case "$running" in *livekit*) ok "The voice container (LiveKit) is running" ;; *) prob "The voice container is not running. './rushlight start', then './rushlight logs livekit'." ;; esac
+
+  if curl -fsS -m 3 "http://127.0.0.1:$port/api/health" >/dev/null 2>&1; then ok "The server answers on port $port"; else prob "The server does not answer on port $port"; fi
+  if curl -fsS -m 3 "http://127.0.0.1:7880" >/dev/null 2>&1; then ok "LiveKit answers on port 7880"; else prob "LiveKit does not answer on port 7880"; fi
+
+  local mode; mode="$(env_get RUSHLIGHT_MODE)"
+  if [ "$mode" = tailscale ]; then
+    case "$running" in *tailscale*) ok "The Tailscale container is running" ;; *) prob "The Tailscale container is not running. './rushlight start', then './rushlight logs tailscale'." ;; esac
+    local tsip; tsip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    if [ -z "$tsip" ]; then prob "This computer is not signed in to Tailscale. Make a key at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    elif [ "$tsip" != "$ip" ]; then prob "This computer's Tailscale address is now $tsip but Rushlight was set up for $ip. Run: ./rushlight address"
+    else ok "Joined Tailscale at $ip"; fi
+    if curl -fsS -m 5 "http://$ip:$port/api/health" >/dev/null 2>&1; then ok "The server answers on its Tailscale address"; else prob "The server does not answer at http://$ip:$port"; fi
+    note "People connect their app to http://$ip:$port. They need Tailscale, on your tailnet or with this machine shared to them (Tailscale admin > Machines > Share)."
+    note "Tailscale mode: nothing here is open to the internet. Do not forward ports on your router for it."
+  elif [ "$mode" = public ]; then
+    local host tls; host="$(env_get PUBLIC_HOST)"; tls="$(env_get TLS_MODE)"
+    [ -n "$host" ] && [ -f Caddyfile ] && ok "Web server settings (Caddyfile) are there" || prob "Caddyfile or PUBLIC_HOST is missing. './rushlight start' makes the file again."
+    case "$running" in *caddy*) ok "The web server container (Caddy) is running" ;; *) prob "The web server container is not running. './rushlight start', then './rushlight logs caddy'." ;; esac
+    local resolved; resolved="$(resolve_ipv4 "$host")"
+    if [ -z "$resolved" ]; then prob "$host does not point anywhere. Add an A record for it at your domain's DNS with this computer's public address ($ip)."
+    elif [ "$resolved" != "$ip" ]; then prob "$host points to $resolved but Rushlight was set up for $ip. Fix the DNS record, or if your address changed run: ./rushlight address NEWADDRESS"
+    else ok "$host points to $ip"; fi
+    local curlopts=(-fsS -m 8); [ "$tls" != internal ] || curlopts+=(-k)
+    if curl "${curlopts[@]}" "https://$host/api/health" >/dev/null 2>&1; then ok "https://$host answers with a working certificate"
+    else prob "https://$host does not answer. Are ports 80 and 443 open and sent to this computer? Is the name right? ('./rushlight logs caddy' shows the certificate attempts)"; fi
+    local code; code="$(curl "${curlopts[@]}" -o /dev/null -w '%{http_code}' "https://$host/rtc/validate" 2>/dev/null || true)"
+    if [ -n "$code" ] && [ "$code" != 404 ] && [ "$code" != 000 ]; then ok "Voice signalling is reachable through the web server"
+    else prob "Voice signalling is not reachable at https://$host/rtc (got '${code:-nothing}')"; fi
+    if curl -fsS -m 3 "http://$ip:7880" >/dev/null 2>&1; then prob "LiveKit's own port 7880 is reachable from outside. It should only be reachable through the web server; check livekit.yaml and your firewall."; fi
+    local seen=""; [ "$tls" = internal ] || seen="$(detect_public_ip)"
+    if [ -n "$seen" ] && [ "$seen" != "$ip" ]; then prob "This computer's public address is now $seen but Rushlight was set up for $ip. Update the DNS record, then run: ./rushlight address $seen"; fi
+    note "Open on your router/firewall: 80 and 443 (TCP), 7881 (TCP), 7882 and 3478 (UDP). Keep port $port closed."
+    note "Public mode: anyone on the internet can reach the sign-in page. Only people with a join code can get in."
+  else
+    local now; now="$(lan_ip)"
+    if [ -z "$now" ]; then
+      note "I could not work out this computer's current network address."
+    elif [ "$now" != "$ip" ]; then
+      prob "This computer's address is now $now but Rushlight was set up for $ip, so voice will fail for other people. Run: ./rushlight address $now"
+    else
+      ok "This computer's address ($ip) is the one Rushlight was set up for"
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+      note "ufw (a firewall) is on. Allow people in: sudo ufw allow $port/tcp; sudo ufw allow 7880/tcp; sudo ufw allow 7881/tcp; sudo ufw allow 7882/udp"
+    fi
+    note "Private mode: only people on your network, or connected to it, can join."
+  fi
+  exit "$bad"
+}
+
+# update [--version vX.Y.Z]: a safe update. Downloads first (nothing changes if that fails), makes an encrypted backup if they are
+# set up, keeps a plain copy of the database as the way back, switches, waits for the server to answer, and if it does not, puts the
+# old version and the old data back.
+cmd_update() {
+  local version="" 
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) version="${2:-}"; shift 2 ;;
+      *) die "I do not know '$1'. Try ./rushlight help." ;;
+    esac
+  done
+  need_docker
+  [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  local img cur target old_id new_id
+  img="$(image_name)"; cur="$(image_version)"; target="${version:-$cur}"
+  old_id="$(docker image inspect -f '{{.Id}}' "$img:$cur" 2>/dev/null || true)"
+  [ -n "$old_id" ] || old_id="$(docker inspect -f '{{.Image}}' "$(compose ps -q server 2>/dev/null | head -n1)" 2>/dev/null || true)"
+
+  say "Downloading $img:$target ..."
+  docker pull "$img:$target" >/dev/null 2>&1 || docker image inspect "$img:$target" >/dev/null 2>&1 || die "I could not download $img:$target (no internet, or no such version). Nothing was changed."
+  new_id="$(docker image inspect -f '{{.Id}}' "$img:$target")"
+  if [ "$new_id" = "$old_id" ] && [ "$target" = "$cur" ]; then say "Already up to date ($cur)."; return 0; fi
+
+  if compose exec -T server test -f /data/backup-public.key >/dev/null 2>&1; then
+    say "Making an encrypted backup first ..."
+    compose exec -T server node src/backup-cli.js now || die "The backup failed, so I did not update. Fix that ('./rushlight backup list') or ask for help."
+  else
+    note_line "Encrypted backups are not set up (./rushlight backup setup). A plain safety copy is made anyway, and removed when the update works."
+  fi
+
+  local helper="${old_id:-$img:$target}"
+  say "Stopping the server and keeping a copy of the data ..."
+  compose stop server >/dev/null
+  volrun "$helper" sh -c 'rm -rf /data/rollback && mkdir /data/rollback && cp -p /data/rushlight.db* /data/rollback/' || { compose up -d server >/dev/null 2>&1 || true; die "I could not make the safety copy, so nothing was changed."; }
+
+  env_set RUSHLIGHT_VERSION "$target"
+  say "Starting $target ..."
+  compose up -d server >/dev/null
+  if wait_healthy "${RUSHLIGHT_UPDATE_WAIT:-90}"; then
+    volrun "$helper" rm -rf /data/rollback >/dev/null 2>&1 || true
+    say "Updated to $target. Rushlight is running at $(public_address)"
+    return 0
+  fi
+
+  warn "The new version did not start properly. Putting the old version and your data back ..."
+  compose stop server >/dev/null 2>&1 || true
+  volrun "$helper" sh -c 'rm -f /data/rushlight.db* && cp -p /data/rollback/rushlight.db* /data/' || die "I could not put the data back. It is safe in the volume $VOLUME, in /data/rollback. Ask for help before doing anything else."
+  env_set RUSHLIGHT_VERSION "$cur"
+  if [ -n "$old_id" ]; then docker tag "$old_id" "$img:$cur"; fi
+  compose up -d server >/dev/null
+  if wait_healthy 60; then
+    volrun "$helper" rm -rf /data/rollback >/dev/null 2>&1 || true
+    warn "Rolled back: Rushlight is running the old version ($cur) again, with your data as it was. Nothing was lost."
+    warn "See what went wrong with: ./rushlight logs server"
+  else
+    warn "The old version did not start either. Your data is safe (encrypted backups, and the copy in /data/rollback). Run ./rushlight check and ./rushlight logs server."
+  fi
+  return 1
+}
+note_line() { say "note     $*"; }
+
+# backup ...: the server's own backup tool (see docs/backups.md), run inside the container. Plus `backup export` to copy the newest
+# backup file out of the container, onto this computer's disk, so it can be put somewhere else.
+cmd_backup() {
+  need_docker
+  case "${1:-}" in
+    export)
+      local name dest="${2:-.}"
+      name="$(compose exec -T server sh -c 'ls -1 /data/backups 2>/dev/null' | tr -d '\r' | grep '\.rlbak$' | sort | tail -n1 || true)"
+      [ -n "$name" ] || die "There are no backups yet. Make one with: ./rushlight backup now"
+      compose cp "server:/data/backups/$name" "$dest/$name"
+      say "Copied $name to $dest. It is encrypted: keep it somewhere that is not on this computer."
+      ;;
+    "") die "Try: ./rushlight backup setup | now | list | check FILE | export [FOLDER]" ;;
+    *)
+      # a terminal for the questions (setup, check, restore) only when there is one; scripts and cron have none
+      local tty=(); [ -t 0 ] || tty=(-T)
+      compose exec "${tty[@]}" server node src/backup-cli.js "$@" ;;
+  esac
+}
+
+# restore FILE.rlbak: put a backup back (asks for the 12 words). Works on a computer that has never run Rushlight: the backup carries
+# the .env, so the secrets (and everyone's sign-ins) come back with it. The data it replaces is kept in the volume in /data/before-restore.
+cmd_restore() {
+  local file="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      *) file="$1"; shift ;;
+    esac
+  done
+  [ -n "$file" ] || die "Give the backup file: ./rushlight restore /path/to/rushlight-2026-01-01.rlbak"
+  [ -f "$file" ] || die "I cannot find $file."
+  need_docker
+  file="$(readlink -f "$file")"
+  local img ver; img="$(image_name)"; ver="$(image_version)"
+  docker image inspect "$img:$ver" >/dev/null 2>&1 || docker pull "$img:$ver" >/dev/null || die "I could not download $img:$ver."
+  if [ -f .env ] && [ "$yes" -ne 1 ]; then
+    say "This REPLACES the server's data and settings with what is in the backup. What is here now is kept (data: inside the Docker volume, in /data/before-restore; settings: .env.before-restore)."
+    printf 'Go ahead? [y/N] '; read -r answer || answer=n
+    case "${answer:-N}" in [Yy]*) ;; *) say "Nothing was changed."; exit 0 ;; esac
+  fi
+  local had_env=0 keep_img="" keep_ver="" keep_lk=""
+  if [ -f .env ]; then had_env=1; keep_img="$(env_get RUSHLIGHT_IMAGE)"; keep_ver="$(env_get RUSHLIGHT_VERSION)"; keep_lk="$(env_get LIVEKIT_VERSION)"; compose stop server >/dev/null 2>&1 || true; fi
+  volrun "$img:$ver" sh -c 'rm -rf /data/restore-tmp /data/before-restore; if [ -f /data/rushlight.db ]; then mkdir /data/before-restore && cp -p /data/rushlight.db* /data/before-restore/; fi'
+  # The file goes into the volume first (read through a plain redirect: its owner on this computer need not be the container's user).
+  ensure_volume
+  docker run --rm -i --network none -v "$VOLUME:/data" --entrypoint sh "$img:$ver" -c 'cat > /data/restore-in.rlbak' < "$file" \
+    || { [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "I could not read $file. Nothing was changed."; }
+  local tty=(-i); [ -t 0 ] && tty=(-it)
+  docker run --rm "${tty[@]}" --network none -v "$VOLUME:/data" --entrypoint node "$img:$ver" src/backup-cli.js restore /data/restore-in.rlbak /data/restore-tmp \
+    || { volrun "$img:$ver" rm -rf /data/restore-tmp /data/restore-in.rlbak >/dev/null 2>&1 || true; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "The backup was not restored (wrong words, or a damaged file). Nothing was changed."; }
+  (umask 077; volrun "$img:$ver" cat /data/restore-tmp/restored.env > .env.restored)
+  [ -s .env.restored ] || { rm -f .env.restored; [ "$had_env" -eq 0 ] || compose up -d server >/dev/null 2>&1 || true; die "That backup holds no settings file. Nothing was changed."; }
+  volrun "$img:$ver" sh -c 'rm -f /data/rushlight.db* && mv /data/restore-tmp/rushlight.db /data/rushlight.db && rm -rf /data/restore-tmp /data/restore-in.rlbak'
+  [ ! -f .env ] || mv .env .env.before-restore
+  mv .env.restored .env
+  fix_env_perms
+  # keep the versions this computer was running (the backup may be from an older one); a new computer takes the backup's
+  if [ "$had_env" -eq 1 ]; then
+    [ -z "$keep_img" ] || env_set RUSHLIGHT_IMAGE "$keep_img"
+    [ -z "$keep_ver" ] || env_set RUSHLIGHT_VERSION "$keep_ver"
+    [ -z "$keep_lk" ] || env_set LIVEKIT_VERSION "$keep_lk"
+  fi
+  # a private server on a new computer has a new address on its network; a public one keeps the public address in its backup
+  case "$(env_get RUSHLIGHT_MODE)" in
+    public) ;;
+    tailscale)
+      # a new computer has not joined Tailscale: it gets a new address, and needs a new key
+      if [ "$had_env" -eq 0 ]; then env_set HOST_IP pending; clear_ts_key; rm -f livekit.yaml; fi ;;
+    *) local ip; ip="$(lan_ip)"; [ -z "$ip" ] || env_set HOST_IP "$ip" ;;
+  esac
+  write_configs
+  say "Restored. Starting ..."
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] && [ "$had_env" -eq 0 ]; then
+    warn "This is a Tailscale server on a new computer: it has to join Tailscale again, with a new key. Make one at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    return 0
+  fi
+  cmd_start
+}
+
+# rotate-secrets [--jwt] [--livekit] [--all] [--yes]: replace secrets with new ones, safely. The old .env is kept until the new
+# secrets are proven to work, and put back if they do not.
+cmd_rotate() {
+  local jwt=0 lk=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jwt) jwt=1; shift ;;
+      --livekit) lk=1; shift ;;
+      --all) jwt=1; lk=1; shift ;;
+      --yes) yes=1; shift ;;
+      *) die "I do not know '$1'. Try ./rushlight help." ;;
+    esac
+  done
+  need_docker
+  [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  if [ "$jwt" -eq 0 ] && [ "$lk" -eq 0 ]; then
+    [ -t 0 ] || die "Say what to rotate: --jwt (sign-ins), --livekit (voice) or --all."
+    say "Which secrets do you want to replace?"
+    printf '  Sign-ins (JWT secret): everyone is signed out and signs in again. [y/N] '; read -r a || a=n; case "${a:-N}" in [Yy]*) jwt=1 ;; esac
+    printf '  Voice (LiveKit key): anyone in a call is dropped and reconnects. [y/N] '; read -r a || a=n; case "${a:-N}" in [Yy]*) lk=1 ;; esac
+    [ "$jwt" -eq 1 ] || [ "$lk" -eq 1 ] || { say "Nothing was changed."; return 0; }
+  fi
+  say "This will:"
+  [ "$jwt" -eq 0 ] || say "  - replace the sign-in secret: EVERYONE is signed out (their password signs them back in), guests have to join again with their code,"
+  [ "$jwt" -eq 0 ] || say "    and no old sign-in token works any more. Chat, accounts, encryption keys and backups are not touched."
+  [ "$lk" -eq 0 ] || say "  - replace the voice key: people in a call are dropped for a moment and their app reconnects by itself."
+  say "  - restart the server (and LiveKit); keep the old settings until the new ones are proven, and put them back if they fail."
+  if [ "$yes" -ne 1 ]; then
+    printf 'Go ahead? [y/N] '; read -r a || a=n
+    case "${a:-N}" in [Yy]*) ;; *) say "Nothing was changed."; return 0 ;; esac
+  fi
+
+  if compose exec -T server test -f /data/backup-public.key >/dev/null 2>&1; then
+    say "Making an encrypted backup first ..."
+    compose exec -T server node src/backup-cli.js now >/dev/null || die "The backup failed, so I changed nothing."
+  fi
+  (umask 077; cp .env .env.before-rotate)
+
+  if [ "$jwt" -eq 1 ]; then
+    # Jellybox's stored Jellyfin key is encrypted with MUSIC_SECRET, or with the JWT secret when there is none: pin it so it stays readable
+    [ -n "$(env_get MUSIC_SECRET)" ] || env_set MUSIC_SECRET "$(env_get JWT_SECRET)"
+    env_set JWT_SECRET "$(random_hex 48)"
+  fi
+  if [ "$lk" -eq 1 ]; then
+    env_set LIVEKIT_API_KEY "API$(random_hex 8)"
+    env_set LIVEKIT_API_SECRET "$(random_hex 32)"
+  fi
+  write_livekit_config
+  say "Restarting with the new secrets ..."
+  if compose up -d --force-recreate server livekit >/dev/null 2>&1 && wait_healthy 90 && verify_livekit; then
+    rm -f .env.before-rotate
+    say "Done. The new secrets work, and the old ones are gone from this computer."
+    [ "$jwt" -eq 0 ] || say "Everyone is signed out and signs in again with their password."
+    say "Old backup files still hold the old secrets. They are encrypted with your phrase; delete the ones you no longer need."
+    return 0
+  fi
+  warn "The new secrets did not work. Putting the old ones back ..."
+  (umask 077; cp .env.before-rotate .env); fix_env_perms
+  write_livekit_config
+  if compose up -d --force-recreate server livekit >/dev/null 2>&1 && wait_healthy 90; then
+    rm -f .env.before-rotate
+    warn "Back to how it was. Nothing was lost. See what went wrong with: ./rushlight logs server"
+  else
+    warn "I could not restart with the old secrets either. They are in .env (and .env.before-rotate). Run ./rushlight check and ./rushlight logs server."
+  fi
+  return 1
+}
+
+# Does LiveKit accept the key the server now holds? (A room list is the smallest question only a matching key can answer.)
+verify_livekit() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    if compose exec -T server node --input-type=module -e "
+      import { RoomServiceClient } from 'livekit-server-sdk'
+      const c = new RoomServiceClient('http://127.0.0.1:7880', process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET)
+      await c.listRooms()" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+# address: the computer moved to a new address on the network.
+cmd_address() {
+  need_docker
+  [ -f .env ] || die "Not set up yet."
+  local mode ip; mode="$(env_get RUSHLIGHT_MODE)"; ip="${1:-}"
+  if [ "$mode" = tailscale ]; then
+    ip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    valid_ip "$ip" || die "This computer is not on Tailscale right now (see ./rushlight check)."
+    env_set HOST_IP "$ip"; write_configs
+    compose up -d --force-recreate livekit
+    say "Done. People now connect to http://$ip:$(env_get PORT) (change the address in their app: Settings > Connection)."
+    return
+  fi
+  if [ "$mode" = public ]; then
+    [ -n "$ip" ] || ip="$(detect_public_ip)"
+    valid_ip "$ip" || die "Give this computer's new public address, for example: ./rushlight address 203.0.113.7"
+    env_set HOST_IP "$ip"
+    if [ "$(env_get PUBLIC_HOST_KIND)" = sslip ]; then
+      env_set PUBLIC_HOST "${ip//./-}.sslip.io"
+      env_set LIVEKIT_PUBLIC_URL "wss://${ip//./-}.sslip.io"
+    fi
+    write_configs
+    compose up -d --force-recreate livekit caddy server
+    say "Done. People now connect to https://$(env_get PUBLIC_HOST)."
+    [ "$(env_get PUBLIC_HOST_KIND)" != sslip ] || say "This name changed with your address: everyone has to change it in their app (Settings > Connection)."
+    [ "$(env_get PUBLIC_HOST_KIND)" != domain ] || say "Make sure $(env_get PUBLIC_HOST) points to $ip at your domain's DNS."
+    return
+  fi
+  [ -n "$ip" ] || ip="$(lan_ip)"
+  valid_ip "$ip" || die "Give the new address, for example: ./rushlight address 192.168.1.20"
+  env_set HOST_IP "$ip"
+  write_configs
+  compose up -d --force-recreate livekit
+  say "Done. People now connect to http://$ip:$(env_get PORT) (change the address in their app: Settings > Connection)."
+}
+
+cmd_help() {
+  cat <<'TXT'
+rushlight setup            make the secrets and settings, then start (first time only)
+  public --domain NAME | --sslip   on the internet, with https (see docs/compose.md)
+  tailscale [--authkey-file F] [--name N]   over Tailscale: no router setup, no domain
+  --ip ADDRESS               use this network address instead of the one found
+  --port N                   the server's port (default 4000)
+  --yes                      do not ask
+rushlight start | stop | restart
+rushlight status
+rushlight logs [server|livekit]
+rushlight check            look for problems, and say what to do about each
+rushlight address [ADDRESS]  this computer's network address changed
+rushlight rotate-secrets [--jwt] [--livekit] [--all] [--yes]   replace the sign-in and/or voice secrets, safely
+rushlight tailscale key [--authkey-file F]   sign this computer in to Tailscale again with a new key
+rushlight update [--version vX.Y.Z]   update safely (backup, copy of the data, and a way back if it does not start)
+rushlight backup setup|now|list|check FILE|export [FOLDER]   encrypted backups
+rushlight restore FILE.rlbak   put a backup back (also onto a new computer)
+TXT
+}
+
+case "${1:-help}" in
+  setup)   shift; cmd_setup "$@" ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  logs)    shift; cmd_logs "$@" ;;
+  check)   cmd_check ;;
+  address) shift; cmd_address "$@" ;;
+  update)  shift; cmd_update "$@" ;;
+  rotate-secrets) shift; cmd_rotate "$@" ;;
+  tailscale) shift; cmd_tailscale "$@" ;;
+  backup)  shift; cmd_backup "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "I do not know '$1'. Try ./rushlight help." ;;
+esac

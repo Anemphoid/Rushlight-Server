@@ -1,0 +1,71 @@
+# Rushlight: the server and LiveKit (voice), plus Caddy (HTTPS) in Public mode.
+# Do not edit by hand: `./rushlight setup` writes .env and livekit.yaml next to this file, and everything here reads them.
+#
+# Both programs share the computer's network ("host" networking, Linux only). That keeps voice simple: LiveKit's one UDP
+# port (7882) is reachable exactly as it is on the machine, with no address translation in between.
+name: rushlight
+
+services:
+  server:
+    image: ${RUSHLIGHT_IMAGE:-ghcr.io/anemphoid/rushlight-server}:${RUSHLIGHT_VERSION:-stable}
+    network_mode: host
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/rushlight.db
+      # The encrypted backups include this file, so a restored server keeps its secrets.
+      BACKUP_ENV_FILE: /config/.env
+    volumes:
+      - data:/data
+      - ./.env:/config/.env:ro
+    depends_on:
+      - livekit
+    stop_grace_period: 15s
+
+  livekit:
+    image: livekit/livekit-server:${LIVEKIT_VERSION}
+    network_mode: host
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  # Public mode only (the "public" profile, switched on by COMPOSE_PROFILES in .env): the web server that gets and renews the
+  # HTTPS certificate by itself and passes visitors on to the server (everything) and LiveKit (/rtc, voice signalling).
+  caddy:
+    image: caddy:${CADDY_VERSION:-2.11.9}
+    profiles: ["public"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # Tailscale mode only (the "tailscale" profile, switched on by COMPOSE_PROFILES in .env): joins this computer to your Tailscale
+  # network. It shares the computer's network, so the server and LiveKit are reachable at the Tailscale address with nothing else.
+  # The one-time sign-in key is in tailscale.env (emptied after the first sign-in); the sign-in itself is kept in the volume.
+  tailscale:
+    image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.104.4}
+    profiles: ["tailscale"]
+    network_mode: host
+    restart: unless-stopped
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - path: tailscale.env
+        required: false
+    environment:
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_ACCEPT_DNS: "false"
+      TS_HOSTNAME: ${TS_HOSTNAME:-rushlight}
+    volumes:
+      - tailscale_state:/var/lib/tailscale
+
+volumes:
+  data:
+  tailscale_state:
+  caddy_data:
+  caddy_config:
