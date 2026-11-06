@@ -29,6 +29,29 @@ People then connect their app to `http://ADDRESS:4000`.
 | `./rushlight start`, `stop`, `restart` | |
 | `./rushlight address [ADDRESS]` | This computer's network address changed: fix voice for it |
 
+## Public mode (on the internet, with https)
+
+    ./rushlight setup public --domain chat.example.com
+    ./rushlight setup public --sslip          # no domain of your own: a free name made from your address
+
+Use this when people outside your network join. A small web server (Caddy) gets and renews the HTTPS certificate by itself and
+passes visitors on: everything to the Rushlight server, and `/rtc` (voice signalling) to LiveKit. People type
+`https://chat.example.com` into their app. LiveKit's own port and the server's port 4000 stay closed to the network.
+
+**You do three things first:**
+1. Have a name that points at this computer: with your own domain, add an **A record** for it with this computer's public
+   address (`setup` stops with advice if the name does not resolve yet). With `--sslip` the name is made for you from the
+   address (`203-0-113-10.sslip.io`).
+2. If the computer is at home, **forward ports on the router** to it: 80 and 443 (TCP), 7881 (TCP), 7882 and 3478 (UDP).
+   On a rented server open those in its firewall. Do **not** open 4000 or 7880.
+3. Use the computer's **public** address (`--public-ip` if it cannot be found).
+
+`--sslip` works with nothing to buy, but the name changes whenever your address does (everyone then changes it in their app:
+`./rushlight address NEWADDRESS` fixes your side and tells you so), and it depends on the free sslip.io service. A domain is better.
+Voice has one UDP port (7882) for direct connections and a built-in relay (UDP 3478, 50000 to 50100) for networks that block
+direct voice, such as some mobile and office networks. `./rushlight check` tests the name, the certificate, the voice route and
+that port 7880 is closed. Anyone on the internet can reach the sign-in page; only people with a join code can get in.
+
 ## Updating
 
     ./rushlight update                 # the newest of what you follow (stable)
@@ -60,7 +83,15 @@ update keeps the data; an update whose new version empties the database and exit
 restores into the running stack (later changes gone, wrong words change nothing) and onto a computer with no settings, stops voice and checks that `check` names the problem, and that no secret reached the
 logs. Not covered there (owner tests): a real network with a firewall, a Raspberry Pi, phones, and people on other networks.
 
+## Public mode test
+
+`docker/stack-test-public.sh` (run by GitHub): the sslip name is made from the address, a missing or bad name is refused, Caddy
+answers https for a name that points at the runner (with a certificate made there), `/rtc` reaches LiveKit and not the server, port
+7880 is closed to the network, http is sent to https, `check` is clean and then names a stopped web server, and two people
+hear each other. **Not tested by GitHub, so yours to try:** a real Let's Encrypt certificate, a router with port forwarding, the
+relay (TURN) with a phone on mobile data, and `--sslip` against the real service.
+
 ## Versions
 
 LiveKit is pinned in `.env` (`LIVEKIT_VERSION`, set by `setup`); the Rushlight server image follows `RUSHLIGHT_VERSION`
-(`stable` unless set otherwise).
+(`stable` unless set otherwise); Caddy is pinned as `CADDY_VERSION`.

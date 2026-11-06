@@ -1,4 +1,4 @@
-# Rushlight, Private mode: the server and LiveKit (voice), on this computer's own network address.
+# Rushlight: the server and LiveKit (voice), plus Caddy (HTTPS) in Public mode.
 # Do not edit by hand: `./rushlight setup` writes .env and livekit.yaml next to this file, and everything here reads them.
 #
 # Both programs share the computer's network ("host" networking, Linux only). That keeps voice simple: LiveKit's one UDP
@@ -30,5 +30,19 @@ services:
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
 
+  # Public mode only (the "public" profile, switched on by COMPOSE_PROFILES in .env): the web server that gets and renews the
+  # HTTPS certificate by itself and passes visitors on to the server (everything) and LiveKit (/rtc, voice signalling).
+  caddy:
+    image: caddy:${CADDY_VERSION:-2.11.9}
+    profiles: ["public"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   data:
+  caddy_data:
+  caddy_config:
