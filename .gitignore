@@ -5,3 +5,4 @@ node_modules/
 *.db-wal
 backups/
 node_modules.prev/
+backup-public.key

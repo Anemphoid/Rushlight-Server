@@ -21,6 +21,7 @@ member; the owner is an admin.
 | Server membership, roles, bans, join codes (the visible half) | several | Yes. The secret half of an invite in an encrypted server is never sent to the server in the clear. |
 | Presence (who is in which space now) | memory | Yes; it is not written to disk. |
 | Jellyfin address and key (if the owner links one) | `server_music` | The key is encrypted at rest with a key from `JWT_SECRET`. |
+| Encrypted backups (if the operator turns them on) | `backups/` next to the database | Not readable by the server or by someone who steals the folder: they need the operator's 12 word phrase, which the machine does not keep. `update.sh`'s pre-update copies are plain (newest 10), for rollback only. |
 | IP addresses | memory only (rate limits) | Not stored and not logged. |
 
 ## What each role can read

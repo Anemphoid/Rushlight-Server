@@ -4,7 +4,7 @@ import { dirname, join } from 'path'
 import { runMigrations } from './migrations.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const dbPath = process.env.DB_PATH || join(__dirname, '..', 'rushlight.db')
+export const dbPath = process.env.DB_PATH || join(__dirname, '..', 'rushlight.db')
 
 export const db = new Database(dbPath)
 db.pragma('journal_mode = WAL')
