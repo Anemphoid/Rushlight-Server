@@ -14,6 +14,7 @@ cd "$HERE"
 
 DEFAULT_LIVEKIT_VERSION="v1.13.11"
 DEFAULT_CADDY_VERSION="2.11.9"
+DEFAULT_TAILSCALE_VERSION="v1.104.4"
 SERVER_PORT_DEFAULT=4000
 
 say()  { printf '%s\n' "$*"; }
@@ -25,6 +26,10 @@ compose() { docker compose --project-directory "$HERE" -f "$HERE/compose.yaml" "
 need_docker() {
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install it from https://docs.docker.com/engine/install/ and run this again."
   docker compose version >/dev/null 2>&1 || die "Docker is here but 'docker compose' is not. Install the Docker Compose plugin (https://docs.docker.com/compose/install/linux/)."
+  local cv; cv="$(docker compose version --short 2>/dev/null | sed 's/^v//' || true)"
+  if [[ "$cv" =~ ^([0-9]+)\.([0-9]+) ]] && { [ "${BASH_REMATCH[1]}" -lt 2 ] || { [ "${BASH_REMATCH[1]}" -eq 2 ] && [ "${BASH_REMATCH[2]}" -lt 24 ]; }; }; then
+    die "Your Docker Compose ($cv) is too old; Rushlight needs 2.24 or newer. Update the Docker Compose plugin (https://docs.docker.com/compose/install/linux/)."
+  fi
   docker info >/dev/null 2>&1 || die "Docker is installed but not running, or you are not allowed to use it. Try 'sudo systemctl start docker', and add yourself to the docker group ('sudo usermod -aG docker \$USER', then log out and in)."
 }
 
@@ -72,7 +77,7 @@ valid_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
 cmd_setup() {
   local mode=private ip="" port="$SERVER_PORT_DEFAULT" yes=0 start=1 version="" lkversion="$DEFAULT_LIVEKIT_VERSION" image=""
-  local domain="" sslip=0 public_ip="" email="" tls=""
+  local domain="" sslip=0 public_ip="" email="" tls="" keyfile="" tsname="rushlight"
   while [ $# -gt 0 ]; do
     case "$1" in
       --ip) ip="${2:-}"; shift 2 ;;
@@ -89,6 +94,9 @@ cmd_setup() {
       --tls-internal) tls=internal; shift ;;   # a certificate made on this computer: for tests only, people's apps will not trust it
       private) mode=private; shift ;;
       public) mode=public; shift ;;
+      tailscale) mode=tailscale; shift ;;
+      --authkey-file) keyfile="${2:-}"; shift 2 ;;
+      --name) tsname="${2:-}"; shift 2 ;;
       *) die "I do not know '$1'. Try ./rushlight help." ;;
     esac
   done
@@ -98,13 +106,21 @@ cmd_setup() {
   fi
   [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "The port '$port' is not a number from 1 to 65535."
 
-  local host="" kind=""
+  local host="" kind="" tskey=""
   if [ "$mode" = private ]; then
     [ -n "$ip" ] || ip="$(lan_ip)"
     [ -n "$ip" ] || die "I could not work out this computer's network address. Run again with --ip followed by it, for example: ./rushlight setup --ip 192.168.1.20"
     valid_ip "$ip" || die "'$ip' does not look like an address such as 192.168.1.20."
     say "Setting up a Private Rushlight server."
     say "  Address people will use: http://$ip:$port  (only people on your network, or connected to it, can reach it)"
+  elif [ "$mode" = tailscale ]; then
+    [[ "$tsname" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die "'$tsname' is not a good device name. Use letters, numbers and dashes, for example: rushlight"
+    tskey="$(read_authkey "$keyfile")"
+    say "Setting up a Rushlight server on Tailscale."
+    say "  This computer joins your Tailscale network (your \"tailnet\") as '$tsname'. People reach Rushlight at that machine's Tailscale"
+    say "  address, from any device on the tailnet or that you share this machine with. Nothing is opened to the internet."
+    say "  The trade-off, plainly: Tailscale's own service knows which of your devices connect to which, the free plan has a limit on"
+    say "  devices, and everyone needs Tailscale installed. In return there is no router setup and no domain."
   else
     if [ -n "$domain" ]; then
       [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || die "'$domain' does not look like a domain name such as chat.example.com."
@@ -147,12 +163,19 @@ cmd_setup() {
     [ -z "$image" ] || echo "RUSHLIGHT_IMAGE=$image"
     echo "RUSHLIGHT_VERSION=${version:-stable}"
     echo "LIVEKIT_VERSION=$lkversion"
-    echo "HOST_IP=$ip"
+    echo "HOST_IP=${ip:-pending}"
     echo "PORT=$port"
     echo "JWT_SECRET=$(random_hex 48)"
     echo "LIVEKIT_URL=ws://127.0.0.1:7880"
     echo "LIVEKIT_API_KEY=API$(random_hex 8)"
     echo "LIVEKIT_API_SECRET=$(random_hex 32)"
+    if [ "$mode" = tailscale ]; then
+      echo "# Tailscale mode: the tailscale container is started with the profile below; HOST_IP is this computer's Tailscale address,"
+      echo "# filled in when it has joined. (The one-time sign-in key is in tailscale.env, not here, and is emptied after use.)"
+      echo "COMPOSE_PROFILES=tailscale"
+      echo "TAILSCALE_VERSION=$DEFAULT_TAILSCALE_VERSION"
+      echo "TS_HOSTNAME=$tsname"
+    fi
     if [ "$mode" = public ]; then
       echo "# Public mode: Caddy (the web server that gets the HTTPS certificate) is started with the profile below."
       echo "COMPOSE_PROFILES=public"
@@ -168,9 +191,64 @@ cmd_setup() {
   } > "$tmp"
   mv "$tmp" .env
   fix_env_perms
+  if [ "$mode" = tailscale ]; then write_ts_key "$tskey"; fi
   write_configs
   say "Secrets and settings written (not shown here; they are in .env)."
   if [ "$start" -eq 1 ]; then cmd_start; fi
+}
+
+# The one-time sign-in key for Tailscale: from a file, from $TS_AUTHKEY, or typed without echo. Never taken from the command line,
+# where other accounts on this computer could read it.
+read_authkey() {
+  local key=""
+  if [ -n "${1:-}" ]; then [ -f "$1" ] || die "I cannot find the key file $1."; key="$(tr -d '[:space:]' < "$1")"
+  elif [ -n "${TS_AUTHKEY:-}" ]; then key="$TS_AUTHKEY"
+  elif [ -t 0 ]; then
+    say "Paste your Tailscale auth key (made at https://login.tailscale.com/admin/settings/keys). You will not see it as you type." >&2
+    printf 'Key: ' >&2; read -rs key || true; printf '\n' >&2
+  else die "I need a Tailscale auth key: put it in a file and use --authkey-file FILE (or run this in a terminal and paste it)."
+  fi
+  [[ "$key" =~ ^tskey-[A-Za-z0-9_-]+$ ]] || die "That does not look like a Tailscale auth key (it starts with tskey-). Make one at https://login.tailscale.com/admin/settings/keys"
+  printf '%s' "$key"
+}
+write_ts_key() { (umask 077; printf 'TS_AUTHKEY=%s\n' "$1" > tailscale.env); }
+clear_ts_key() { (umask 077; printf '# the one-time key was used and removed\n' > tailscale.env); }
+
+# Join the tailnet (the container signs in with the key) and learn this computer's Tailscale address, which LiveKit has to advertise.
+tailscale_connect() {
+  [ -f tailscale.env ] || clear_ts_key
+  compose up -d tailscale >/dev/null
+  say "Joining Tailscale ..."
+  local i ip=""
+  for ((i = 0; i < ${RUSHLIGHT_TS_WAIT:-90}; i++)); do
+    ip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    valid_ip "$ip" && break
+    ip=""; sleep 1
+  done
+  if [ -z "$ip" ]; then
+    warn "This computer did not join Tailscale. The key may be wrong, expired or already used, or Tailscale cannot be reached."
+    warn "Make a new key at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    warn "('./rushlight logs tailscale' shows what Tailscale said.)"
+    return 1
+  fi
+  env_set HOST_IP "$ip"
+  write_configs
+  clear_ts_key
+  say "Joined Tailscale as $ip"
+}
+
+cmd_tailscale() {
+  case "${1:-}" in
+    key)
+      need_docker
+      [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] || die "This server is not in Tailscale mode."
+      shift; local keyfile=""; [ "${1:-}" != --authkey-file ] || keyfile="${2:-}"
+      write_ts_key "$(read_authkey "$keyfile")"
+      compose up -d --force-recreate tailscale >/dev/null
+      tailscale_connect && cmd_start
+      ;;
+    *) die "Try: ./rushlight tailscale key" ;;
+  esac
 }
 
 resolve_ipv4() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}' || true; }
@@ -183,6 +261,8 @@ detect_public_ip() {
 }
 
 write_configs() {
+  # Tailscale mode: nothing to write until the computer has joined and has its address
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] && ! valid_ip "$(env_get HOST_IP)"; then return 0; fi
   write_livekit_config
   if [ "$(env_get RUSHLIGHT_MODE)" = public ]; then write_caddyfile; fi
 }
@@ -249,6 +329,7 @@ write_caddyfile() {
 cmd_start() {
   need_docker
   [ -f .env ] || die "Not set up yet. Run './rushlight setup' first."
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ]; then tailscale_connect || return 1; fi
   [ -f livekit.yaml ] || write_configs
   [ "$(env_get RUSHLIGHT_MODE)" != public ] || [ -f Caddyfile ] || write_configs
   # No pull here on purpose: only ./rushlight update changes versions, so a restart can never move you onto a new one.
@@ -316,7 +397,16 @@ cmd_check() {
   if curl -fsS -m 3 "http://127.0.0.1:7880" >/dev/null 2>&1; then ok "LiveKit answers on port 7880"; else prob "LiveKit does not answer on port 7880"; fi
 
   local mode; mode="$(env_get RUSHLIGHT_MODE)"
-  if [ "$mode" = public ]; then
+  if [ "$mode" = tailscale ]; then
+    case "$running" in *tailscale*) ok "The Tailscale container is running" ;; *) prob "The Tailscale container is not running. './rushlight start', then './rushlight logs tailscale'." ;; esac
+    local tsip; tsip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    if [ -z "$tsip" ]; then prob "This computer is not signed in to Tailscale. Make a key at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    elif [ "$tsip" != "$ip" ]; then prob "This computer's Tailscale address is now $tsip but Rushlight was set up for $ip. Run: ./rushlight address"
+    else ok "Joined Tailscale at $ip"; fi
+    if curl -fsS -m 5 "http://$ip:$port/api/health" >/dev/null 2>&1; then ok "The server answers on its Tailscale address"; else prob "The server does not answer at http://$ip:$port"; fi
+    note "People connect their app to http://$ip:$port. They need Tailscale, on your tailnet or with this machine shared to them (Tailscale admin > Machines > Share)."
+    note "Tailscale mode: nothing here is open to the internet. Do not forward ports on your router for it."
+  elif [ "$mode" = public ]; then
     local host tls; host="$(env_get PUBLIC_HOST)"; tls="$(env_get TLS_MODE)"
     [ -n "$host" ] && [ -f Caddyfile ] && ok "Web server settings (Caddyfile) are there" || prob "Caddyfile or PUBLIC_HOST is missing. './rushlight start' makes the file again."
     case "$running" in *caddy*) ok "The web server container (Caddy) is running" ;; *) prob "The web server container is not running. './rushlight start', then './rushlight logs caddy'." ;; esac
@@ -477,9 +567,19 @@ cmd_restore() {
     [ -z "$keep_lk" ] || env_set LIVEKIT_VERSION "$keep_lk"
   fi
   # a private server on a new computer has a new address on its network; a public one keeps the public address in its backup
-  if [ "$(env_get RUSHLIGHT_MODE)" != public ]; then local ip; ip="$(lan_ip)"; [ -z "$ip" ] || env_set HOST_IP "$ip"; fi
+  case "$(env_get RUSHLIGHT_MODE)" in
+    public) ;;
+    tailscale)
+      # a new computer has not joined Tailscale: it gets a new address, and needs a new key
+      if [ "$had_env" -eq 0 ]; then env_set HOST_IP pending; clear_ts_key; rm -f livekit.yaml; fi ;;
+    *) local ip; ip="$(lan_ip)"; [ -z "$ip" ] || env_set HOST_IP "$ip" ;;
+  esac
   write_configs
   say "Restored. Starting ..."
+  if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ] && [ "$had_env" -eq 0 ]; then
+    warn "This is a Tailscale server on a new computer: it has to join Tailscale again, with a new key. Make one at https://login.tailscale.com/admin/settings/keys and run: ./rushlight tailscale key"
+    return 0
+  fi
   cmd_start
 }
 
@@ -488,6 +588,14 @@ cmd_address() {
   need_docker
   [ -f .env ] || die "Not set up yet."
   local mode ip; mode="$(env_get RUSHLIGHT_MODE)"; ip="${1:-}"
+  if [ "$mode" = tailscale ]; then
+    ip="$(compose exec -T tailscale tailscale ip -4 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    valid_ip "$ip" || die "This computer is not on Tailscale right now (see ./rushlight check)."
+    env_set HOST_IP "$ip"; write_configs
+    compose up -d --force-recreate livekit
+    say "Done. People now connect to http://$ip:$(env_get PORT) (change the address in their app: Settings > Connection)."
+    return
+  fi
   if [ "$mode" = public ]; then
     [ -n "$ip" ] || ip="$(detect_public_ip)"
     valid_ip "$ip" || die "Give this computer's new public address, for example: ./rushlight address 203.0.113.7"
@@ -515,6 +623,7 @@ cmd_help() {
   cat <<'TXT'
 rushlight setup            make the secrets and settings, then start (first time only)
   public --domain NAME | --sslip   on the internet, with https (see docs/compose.md)
+  tailscale [--authkey-file F] [--name N]   over Tailscale: no router setup, no domain
   --ip ADDRESS               use this network address instead of the one found
   --port N                   the server's port (default 4000)
   --yes                      do not ask
@@ -523,6 +632,7 @@ rushlight status
 rushlight logs [server|livekit]
 rushlight check            look for problems, and say what to do about each
 rushlight address [ADDRESS]  this computer's network address changed
+rushlight tailscale key [--authkey-file F]   sign this computer in to Tailscale again with a new key
 rushlight update [--version vX.Y.Z]   update safely (backup, copy of the data, and a way back if it does not start)
 rushlight backup setup|now|list|check FILE|export [FOLDER]   encrypted backups
 rushlight restore FILE.rlbak   put a backup back (also onto a new computer)
@@ -539,6 +649,7 @@ case "${1:-help}" in
   check)   cmd_check ;;
   address) shift; cmd_address "$@" ;;
   update)  shift; cmd_update "$@" ;;
+  tailscale) shift; cmd_tailscale "$@" ;;
   backup)  shift; cmd_backup "$@" ;;
   restore) shift; cmd_restore "$@" ;;
   help|-h|--help) cmd_help ;;

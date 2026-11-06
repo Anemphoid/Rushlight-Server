@@ -52,6 +52,26 @@ Voice has one UDP port (7882) for direct connections and a built-in relay (UDP 3
 direct voice, such as some mobile and office networks. `./rushlight check` tests the name, the certificate, the voice route and
 that port 7880 is closed. Anyone on the internet can reach the sign-in page; only people with a join code can get in.
 
+## Tailscale mode (friends over a private network, nothing opened to the internet)
+
+    ./rushlight setup tailscale                       # asks you to paste a key (not shown as you type)
+    ./rushlight setup tailscale --authkey-file key.txt --name my-rushlight
+
+Tailscale gives every device you sign in a private address (100.x.y.z) that only your devices, and devices you share with, can
+reach. This computer joins your Tailscale network, and Rushlight is at that address: no router setup, no domain, no certificate.
+People need Tailscale on their device: either you invite them to your network, or in the Tailscale admin you **share this
+machine** with them (they keep their own network). They then type `http://100.x.y.z:4000` into their Rushlight app.
+
+**Before you start:** make a Tailscale account (free), then at https://login.tailscale.com/admin/settings/keys make an **auth
+key** (one use is enough; it expires by itself). `setup` takes it from a file or a hidden prompt, **never from the command line**
+(others on the computer could read it there). It is kept in `tailscale.env`, readable only by you, only the Tailscale container
+is given it, it is **emptied right after the first sign-in** and is not in `.env` or the backups. The sign-in itself lives in the
+`tailscale_state` volume. If that is lost (a new computer, a restore), make a new key and run `./rushlight tailscale key`.
+
+**The trade-off, plainly:** Tailscale's own service knows which of your devices connect to which (not what is said), the free
+plan limits the number of devices, and everyone must install Tailscale. It is less private than Private mode and easier than
+Public mode. Voice travels over the same private network (LiveKit advertises the Tailscale address).
+
 ## Updating
 
     ./rushlight update                 # the newest of what you follow (stable)
@@ -82,6 +102,14 @@ the account still there, stops and starts, makes an encrypted backup and checks 
 update keeps the data; an update whose new version empties the database and exits is rolled back to the old version and data),
 restores into the running stack (later changes gone, wrong words change nothing) and onto a computer with no settings, stops voice and checks that `check` names the problem, and that no secret reached the
 logs. Not covered there (owner tests): a real network with a firewall, a Raspberry Pi, phones, and people on other networks.
+
+## Tailscale mode test
+
+`docker/stack-test-tailscale.sh` (run by GitHub, **with no Tailscale account**): the files it writes, that the key is only in
+`tailscale.env` (mode 600) and only the Tailscale container is given it, that a key on the command line or a malformed key is
+refused, that a wrong key fails with advice and the server and LiveKit do not start, and that `check` says the computer is not signed in. If you
+add a GitHub secret named `TS_TEST_AUTHKEY` (a **reusable, ephemeral** key from your Tailscale account), it also joins for real,
+runs `check`, and has two people hear each other over the Tailscale address. Without it, the real sign-in is **your test**.
 
 ## Public mode test
 
