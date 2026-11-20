@@ -6,6 +6,12 @@ Before you start: [Get a computer ready](get-ready.md).
 address on it, like `http://100.64.1.5:4000`. Only devices on your tailnet, or that you share the computer with, can see it.
 Nothing is opened on your router.
 
+**Install Tailscale on this computer, the one that runs Rushlight, and nowhere else.** Do not make another machine (a Proxmox
+host, a router, a Raspberry Pi) share this computer's home-network address with "subnet routes": those routes name one address
+on your home network, so when your router hands the computer a different address, nobody can reach it until you change the route
+by hand and approve it in the Tailscale admin console. With Tailscale on this computer, Rushlight lives at this computer's own
+Tailscale address (`100.x.y.z`), which does not change when your router does.
+
 **The trade, in plain words.** Tailscale the company can see which of your devices connect to which (never what is said). The
 free plan limits devices (check Tailscale's own pricing page for today's limit). Everyone needs the Tailscale app.
 

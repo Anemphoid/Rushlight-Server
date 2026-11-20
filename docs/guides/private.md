@@ -37,9 +37,14 @@ Then [invite your friends](invite-friends.md).
 
 ## Things to know
 
-- **The address can change.** Home routers sometimes give a computer a new address after a restart. If voice stops working,
-  run `./rushlight check`; if it says the address changed, run `./rushlight address`. Better: in your router's settings, "reserve" this
-  computer's address so it never changes.
+- **The address can change.** Home routers sometimes give a computer a new address after a restart or an update, and then voice
+  stops while chat carries on. Three layers, use all you can: (1) in your router's settings "reserve" this computer's address so
+  it never changes (look for DHCP reservation or static lease), and do not set a different fixed address inside the computer
+  unless it is the same one; (2) run `./rushlight autofix on`: the computer then checks every minute and fixes voice by itself when
+  its address changes (what it did is written in `.autofix.log`); (3) if you have not, the admin screen in the app tells you the
+  new address and gives you a message to send your friends, and `./rushlight check` then `./rushlight address` fixes it by hand.
+  Your friends still have to type the new address in their app (**Settings > Connection**); they see "This server may have
+  moved" and a field for it.
 - **It starts again by itself** after the computer restarts (Docker starts it). If it does not, `./rushlight start`.
 - **To stop it:** `./rushlight stop`. **To start:** `./rushlight start`.
 - **Private means private.** Nobody outside your network can reach it. To let faraway friends in, you would need a VPN, or
