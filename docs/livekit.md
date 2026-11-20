@@ -50,6 +50,14 @@ Generate a secret with `openssl rand -hex 32`. The part before the colon
 Do not use LiveKit's `--dev` mode for a real setup. It uses a well-known key and
 secret, which anyone could use to join your rooms.
 
+If you pin the machine's address in this file (`rtc.node_ip`) or in a TURN config, it is written by hand in one more place for
+every service, and a router that gives the machine a different address breaks voice while chat carries on. Prefer letting each
+service find its own interface address, reserve the machine's address in your router, and know that the server now says so in its
+log and to its owner and admins in the app when `LIVEKIT_URL` (or `HOST_IP`) names an address the machine no longer has. After
+changing an address in a file, recreate the containers (`docker compose up -d --force-recreate`): Docker keeps serving the old
+copy of a single mounted file after an editor or `sed -i` replaces it. The Compose stack (`docs/compose.md`) does all of this for
+you.
+
 Start it with that file, for example `livekit-server --config livekit.yaml`, and
 run it as a service (systemd or Docker with a restart policy) so it survives a
 reboot.

@@ -37,12 +37,21 @@ random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
 lan_ip() {
   local ip=""
+  [ -z "${RUSHLIGHT_TEST_LAN_IP+x}" ] || { printf '%s' "$RUSHLIGHT_TEST_LAN_IP"; return; }
   if command -v ip >/dev/null 2>&1; then
     ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
   fi
   [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
   printf '%s' "$ip"
 }
+
+# Addresses this computer has right now (one per line). RUSHLIGHT_TEST_ADDRESSES, when set, stands in for them (the tests use it).
+my_addresses() {
+  if [ -n "${RUSHLIGHT_TEST_ADDRESSES:-}" ]; then printf '%s\n' $RUSHLIGHT_TEST_ADDRESSES; return; fi
+  if command -v ip >/dev/null 2>&1; then ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'; return; fi
+  hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+}
+has_address() { my_addresses | grep -qx "$1"; }
 
 env_get() { [ -f .env ] && sed -n "s/^$1=//p" .env | head -n1 || true; }
 
@@ -334,6 +343,18 @@ cmd_start() {
   if [ "$(env_get RUSHLIGHT_MODE)" = tailscale ]; then tailscale_connect || return 1; fi
   [ -f livekit.yaml ] || write_configs
   [ "$(env_get RUSHLIGHT_MODE)" != public ] || [ -f Caddyfile ] || write_configs
+  # A computer that came back with a new address (a router restart, a new network) must not start voice on the old one.
+  # Only when the address in .env is gone from this computer: an address chosen on purpose (setup --ip) is kept.
+  case "$(env_get RUSHLIGHT_MODE)" in
+    public|tailscale) ;;
+    *)
+      local was now; was="$(env_get HOST_IP)"; now="$(lan_ip)"
+      if valid_ip "$was" && valid_ip "$now" && [ "$now" != "$was" ] && ! has_address "$was"; then
+        say "This computer's address changed from $was to $now. Voice is set up for the new one."
+        env_set HOST_IP "$now"; write_configs
+        say "People have to change the server address in their app (Settings > Connection) to http://$now:$(env_get PORT). A message you can send them: \"The server's address changed. New address: http://$now:$(env_get PORT)\""
+      fi ;;
+  esac
   # No pull here on purpose: only ./rushlight update changes versions, so a restart can never move you onto a new one.
   compose up -d
   say "Waiting for the server to answer..."
@@ -668,6 +689,25 @@ verify_livekit() {
 
 # address: the computer moved to a new address on the network.
 cmd_address() {
+  local auto=0
+  if [ "${1:-}" = --auto ]; then auto=1; shift; fi
+  if [ "$auto" -eq 1 ]; then
+    # Quiet and safe to run every minute: does nothing unless this computer has lost the address in .env.
+    [ -f .env ] || exit 0
+    [ "$(env_get RUSHLIGHT_MODE)" != public ] || exit 0
+    local was; was="$(env_get HOST_IP)"
+    valid_ip "$was" || exit 0
+    has_address "$was" && exit 0
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || exit 0
+    if [ "$(env_get RUSHLIGHT_MODE)" != tailscale ]; then
+      local now; now="$(lan_ip)"
+      valid_ip "$now" || exit 0
+      [ "$now" != "$was" ] || exit 0
+      say "$(date '+%Y-%m-%d %H:%M:%S') The address changed from $was to $now. Updating voice."
+    else
+      say "$(date '+%Y-%m-%d %H:%M:%S') The Tailscale address is no longer $was. Updating voice."
+    fi
+  fi
   need_docker
   [ -f .env ] || die "Not set up yet."
   local mode ip; mode="$(env_get RUSHLIGHT_MODE)"; ip="${1:-}"
@@ -702,6 +742,26 @@ cmd_address() {
   say "Done. People now connect to http://$ip:$(env_get PORT) (change the address in their app: Settings > Connection)."
 }
 
+# autofix on|off|status: look every minute (and at boot) for a new address and fix voice by itself, with no one typing anything.
+AUTOFIX_TAG="# rushlight-autofix"
+cmd_autofix() {
+  command -v crontab >/dev/null 2>&1 || die "This computer has no cron ('crontab'), which is what keeps watch. Install it, or run ./rushlight address when the address changes."
+  local line current
+  line="* * * * * cd '$HERE' && ./rushlight address --auto >> '$HERE/.autofix.log' 2>&1 $AUTOFIX_TAG"
+  current="$(crontab -l 2>/dev/null | grep -vF "$AUTOFIX_TAG" || true)"
+  case "${1:-status}" in
+    on)
+      { [ -z "$current" ] || printf '%s\n' "$current"; printf '@reboot sleep 30 && %s\n' "${line#\* \* \* \* \* }"; printf '%s\n' "$line"; } | crontab -
+      say "Done. Every minute this computer checks its address, and fixes voice by itself when it changes (what it did is in $HERE/.autofix.log)." ;;
+    off)
+      if [ -n "$current" ]; then printf '%s\n' "$current" | crontab -; else crontab -r 2>/dev/null || true; fi
+      say "Done. This computer no longer watches its address." ;;
+    status)
+      if crontab -l 2>/dev/null | grep -qF "$AUTOFIX_TAG"; then say "On: this computer fixes voice by itself when its address changes."; else say "Off. Turn it on with: ./rushlight autofix on"; fi ;;
+    *) die "Try: ./rushlight autofix on | off | status" ;;
+  esac
+}
+
 cmd_help() {
   cat <<'TXT'
 rushlight setup            make the secrets and settings, then start (first time only)
@@ -715,6 +775,7 @@ rushlight status
 rushlight logs [server|livekit]
 rushlight check            look for problems, and say what to do about each
 rushlight address [ADDRESS]  this computer's network address changed
+rushlight autofix on|off|status   fix voice by itself when this computer's address changes (checks every minute)
 rushlight rotate-secrets [--jwt] [--livekit] [--all] [--yes]   replace the sign-in and/or voice secrets, safely
 rushlight tailscale key [--authkey-file F]   sign this computer in to Tailscale again with a new key
 rushlight update [--version vX.Y.Z]   update safely (backup, copy of the data, and a way back if it does not start)
@@ -732,6 +793,7 @@ case "${1:-help}" in
   logs)    shift; cmd_logs "$@" ;;
   check)   cmd_check ;;
   address) shift; cmd_address "$@" ;;
+  autofix) shift; cmd_autofix "$@" ;;
   update)  shift; cmd_update "$@" ;;
   rotate-secrets) shift; cmd_rotate "$@" ;;
   tailscale) shift; cmd_tailscale "$@" ;;
