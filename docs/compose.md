@@ -30,6 +30,27 @@ People then connect their app to `http://ADDRESS:4000`.
 | `./rushlight status`, `logs [server\|livekit]` | What is running; the recent log |
 | `./rushlight start`, `stop`, `restart` | |
 | `./rushlight address [ADDRESS]` | This computer's network address changed: fix voice for it |
+| `./rushlight autofix on\|off\|status` | Check every minute (and at boot) and fix voice by itself when the address changes |
+
+## When the computer's address changes
+
+Voice needs LiveKit to advertise the computer's real address. A home router can hand out a different one after a restart, and then
+chat keeps working while voice fails (the app says it could not establish the connection). Three things keep this from stranding
+anyone:
+
+- **The server notices.** It compares the address in `.env` (`HOST_IP`) with the addresses the computer really has, writes one
+  line in its log, and, while they differ, owners and admins get `addressChange` in the server answer (`GET /api/servers/:id`): the
+  old address, the new one, and a ready-to-send message for friends. Members never see it. Public servers are not judged (their
+  address belongs to the internet, not to a network card), and neither is a name.
+- **`./rushlight start` fixes it** when the address in `.env` is gone from the computer. An address chosen on purpose
+  (`setup --ip`) is kept while the computer still has it.
+- **`./rushlight autofix on`** puts a check in cron (every minute and at boot): when the address is gone it updates `.env`, writes
+  `livekit.yaml` again and recreates LiveKit, and writes what it did to `.autofix.log`. Nothing happens in the other minutes.
+
+The server cannot repair LiveKit from inside its own container (it has no control of Docker, on purpose), which is why the fix lives
+on the computer. People still have to type the new address in their app (**Settings > Connection**); in Tailscale mode there is
+nothing to type, because the Tailscale address does not move with the router. Tell people to **reserve** the computer's address in
+the router (DHCP reservation) as well.
 
 ## Public mode (on the internet, with https)
 

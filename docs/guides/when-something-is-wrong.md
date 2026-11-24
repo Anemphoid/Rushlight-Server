@@ -16,7 +16,7 @@ common ones in more words. Then run `check` again.
 | No .env | You are in the wrong folder, or have not run setup | `cd ~/rushlight`; `./rushlight setup` |
 | The server container is not running | It stopped | `./rushlight start`, then `./rushlight logs server` |
 | The voice container is not running | LiveKit stopped | `./rushlight start`, then `./rushlight logs livekit` |
-| This computer's address is now X but Rushlight was set up for Y | Your home router gave it a new address | `./rushlight address` (and reserve the address in your router) |
+| This computer's address is now X but Rushlight was set up for Y | Your home router gave it a new address | `./rushlight address` (and reserve the address in your router; `./rushlight autofix on` makes this fix itself next time) |
 | (Public) X does not point anywhere / points to Z | The domain's A record is missing or wrong | Fix it at your domain's DNS; wait a few minutes |
 | (Public) https://X does not answer | The doors (80, 443) are not open, or the name has not spread | Port forwarding in [the Public guide](public.md) step 4; wait and retry |
 | (Public) Voice signalling is not reachable | The web server is not passing `/rtc` on, or is stopped | `./rushlight logs caddy` |

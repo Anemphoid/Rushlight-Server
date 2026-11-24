@@ -56,6 +56,7 @@ import {
 } from './ownership.js'
 import { livekitUrlForClient, checkPublicLivekitUrl } from './livekit-url.js'
 import { startBackupScheduler } from './backup.js'
+import { createAddressWatch } from './address-watch.js'
 
 const LIVEKIT_URL = process.env.LIVEKIT_URL
 const LIVEKIT_PUBLIC_URL = checkPublicLivekitUrl(process.env.LIVEKIT_PUBLIC_URL)
@@ -1207,6 +1208,8 @@ app.get('/api/servers/:id', requireAuth, requireServerMember, (req, res) => {
     channels: serializeTree(server.id),
     presence: presenceForServer(server.id),
     proposals: proposalsForServer(server.id, req.account.sub),
+    // owners and admins are told when this computer's address is no longer the one in the settings (voice stops working)
+    ...(req.membership.is_admin && addressWatch.view() ? { addressChange: addressWatch.view() } : {}),
     ...ownershipView(server.id, req.account.sub, !!req.membership.is_admin)
   })
 })
@@ -3568,6 +3571,7 @@ process.on('uncaughtException', (err) => {
 })
 
 const PORT = process.env.PORT || 4000
+const addressWatch = createAddressWatch({ port: PORT })
 const wiped = wipeAllEphemeralOnStartup()
 function runRetention() {
   try {
@@ -3593,6 +3597,8 @@ setInterval(() => {
   // rejection take the whole process down
   sweepMemberships().catch((err) => console.error('sweepMemberships:', err))
 }, SWEEP_MS).unref()
+addressWatch.refresh()
+setInterval(() => addressWatch.refresh(), Number(process.env.ADDRESS_CHECK_MS) || 30000).unref()
 app.listen(PORT, () => {
   console.log(`Rushlight server listening on port ${PORT}`)
   if (wiped) console.log(`Cleared ${wiped} ephemeral message(s) left over from before the restart`)
